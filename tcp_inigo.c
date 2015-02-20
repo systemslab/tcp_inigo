@@ -1,12 +1,32 @@
-/* DataCenter TCP (DCTCP) congestion control.
+/* TCP Inigo congestion control.
+ *
+ * This is an implementation of TCP Inigo, which takes the measure of
+ * the extent of congestion introduced in DCTCP and applies it to
+ * networks outside the data center, including wireless.
+ *
+ * https://www.soe.ucsc.edu/research/technical-reports/UCSC-SOE-14-14
+ *
+ * The motivation behind the "dampen" functionality comes from:
+ *
+ * Alizadeh, Mohammad, et al.
+ * "Stability analysis of QCN: the averaging principle."
+ * Proceedings of the ACM SIGMETRICS joint international conference
+ * on Measurement and modeling of computer systems. ACM, 2011.
+ * http://sedcl.stanford.edu.oca.ucsc.edu/files/qcn-analysis.pdf
+ *
+ * Authors:
+ *
+ *	Andrew Shewmaker <agshew@gmail.com>
+ *
+ * Forked from DataCenter TCP (DCTCP) congestion control.
  *
  * http://simula.stanford.edu/~alizade/Site/DCTCP.html
  *
- * This is an implementation of DCTCP over Reno, an enhancement to the
- * TCP congestion control algorithm designed for data centers. DCTCP
- * leverages Explicit Congestion Notification (ECN) in the network to
- * provide multi-bit feedback to the end hosts. DCTCP's goal is to meet
- * the following three data center transport requirements:
+ * DCTCP is an enhancement to the TCP congestion control algorithm
+ * designed for data centers. DCTCP leverages Explicit Congestion
+ * Notification (ECN) in the network to provide multi-bit feedback to
+ * the end hosts. DCTCP's goal is to meet the following three data
+ * center transport requirements:
  *
  *  - High burst tolerance (incast due to partition/aggregate)
  *  - Low latency (short flows, queries)
@@ -28,7 +48,7 @@
  *
  * Initial prototype from Abdul Kabbani, Masato Yasuda and Mohammad Alizadeh.
  *
- * Authors:
+ * DCTCP Authors:
  *
  *	Daniel Borkmann <dborkman@redhat.com>
  *	Florian Westphal <fw@strlen.de>
@@ -47,7 +67,7 @@
 
 #define DCTCP_MAX_ALPHA	1024U
 
-struct dctcp {
+struct inigo {
 	u32 acked_bytes_ecn;
 	u32 acked_bytes_total;
 	u32 prior_snd_una;
@@ -56,6 +76,9 @@ struct dctcp {
 	u32 next_seq;
 	u32 ce_state;
 	u32 delayed_ack_reserved;
+	u32 rtt_min;
+	u32 rtt_alpha;
+	u32 delayed_cnt;
 };
 
 static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
@@ -71,9 +94,7 @@ module_param(dctcp_clamp_alpha_on_loss, uint, 0644);
 MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 		 "parameter for clamping alpha on loss");
 
-static struct tcp_congestion_ops dctcp_reno;
-
-static void dctcp_reset(const struct tcp_sock *tp, struct dctcp *ca)
+static void dctcp_reset(const struct tcp_sock *tp, struct inigo *ca)
 {
 	ca->next_seq = tp->snd_nxt;
 
@@ -81,19 +102,21 @@ static void dctcp_reset(const struct tcp_sock *tp, struct dctcp *ca)
 	ca->acked_bytes_total = 0;
 }
 
-static void dctcp_init(struct sock *sk)
+static void inigo_init(struct sock *sk)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
+	struct inigo *ca = inet_csk_ca(sk);
 
 	if ((tp->ecn_flags & TCP_ECN_OK) ||
 	    (sk->sk_state == TCP_LISTEN ||
 	     sk->sk_state == TCP_CLOSE)) {
-		struct dctcp *ca = inet_csk_ca(sk);
-
 		ca->prior_snd_una = tp->snd_una;
 		ca->prior_rcv_nxt = tp->rcv_nxt;
 
 		ca->dctcp_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
+
+		ca->rtt_min = USEC_PER_SEC;
+		ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
 
 		ca->delayed_ack_reserved = 0;
 		ca->ce_state = 0;
@@ -102,19 +125,21 @@ static void dctcp_init(struct sock *sk)
 		return;
 	}
 
-	/* No ECN support? Fall back to Reno. Also need to clear
-	 * ECT from sk since it is set during 3WHS for DCTCP.
+	/* No ECN support? Fall back to other congestion control methods.
+	 * Also need to clear ECT from sk since it is set during 3WHS for DCTCP.
 	 */
-	inet_csk(sk)->icsk_ca_ops = &dctcp_reno;
+	ca->dctcp_alpha = 0;
 	INET_ECN_dontxmit(sk);
 }
 
-static u32 dctcp_ssthresh(struct sock *sk)
+static u32 inigo_ssthresh(struct sock *sk)
 {
-	const struct dctcp *ca = inet_csk_ca(sk);
+	const struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
+	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
 
-	return max(tp->snd_cwnd - ((tp->snd_cwnd * ca->dctcp_alpha) >> 11U), 2U);
+	pr_debug_ratelimited("tcp_inigo: ssthresh: snd_cwnd=%u, snd_ssthresh=%u, alpha=%u, return=%u", tp->snd_cwnd, tp->snd_ssthresh, alpha, max(tp->snd_cwnd - ((tp->snd_cwnd * alpha) >> 11U), 2U));
+	return max(tp->snd_cwnd - ((tp->snd_cwnd * alpha) >> 11U), 2U);
 }
 
 /* Minimal DCTP CE state machine:
@@ -125,7 +150,7 @@ static u32 dctcp_ssthresh(struct sock *sk)
 
 static void dctcp_ce_state_0_to_1(struct sock *sk)
 {
-	struct dctcp *ca = inet_csk_ca(sk);
+	struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 
 	/* State has changed from CE=0 to CE=1 and delayed
@@ -155,7 +180,7 @@ static void dctcp_ce_state_0_to_1(struct sock *sk)
 
 static void dctcp_ce_state_1_to_0(struct sock *sk)
 {
-	struct dctcp *ca = inet_csk_ca(sk);
+	struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 
 	/* State has changed from CE=1 to CE=0 and delayed
@@ -183,10 +208,10 @@ static void dctcp_ce_state_1_to_0(struct sock *sk)
 	tp->ecn_flags &= ~TCP_ECN_DEMAND_CWR;
 }
 
-static void dctcp_update_alpha(struct sock *sk, u32 flags)
+static void inigo_update_alpha(struct sock *sk, u32 flags)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
-	struct dctcp *ca = inet_csk_ca(sk);
+	struct inigo *ca = inet_csk_ca(sk);
 	u32 acked_bytes = tp->snd_una - ca->prior_snd_una;
 
 	/* If ack did not advance snd_una, count dupack as MSS size.
@@ -222,10 +247,10 @@ static void dctcp_update_alpha(struct sock *sk, u32 flags)
 	}
 }
 
-static void dctcp_state(struct sock *sk, u8 new_state)
+static void inigo_state(struct sock *sk, u8 new_state)
 {
 	if (dctcp_clamp_alpha_on_loss && new_state == TCP_CA_Loss) {
-		struct dctcp *ca = inet_csk_ca(sk);
+		struct inigo *ca = inet_csk_ca(sk);
 
 		/* If this extension is enabled, we clamp dctcp_alpha to
 		 * max on packet loss; the motivation is that dctcp_alpha
@@ -241,7 +266,7 @@ static void dctcp_state(struct sock *sk, u8 new_state)
 
 static void dctcp_update_ack_reserved(struct sock *sk, enum tcp_ca_event ev)
 {
-	struct dctcp *ca = inet_csk_ca(sk);
+	struct inigo *ca = inet_csk_ca(sk);
 
 	switch (ev) {
 	case CA_EVENT_DELAYED_ACK:
@@ -258,7 +283,7 @@ static void dctcp_update_ack_reserved(struct sock *sk, enum tcp_ca_event ev)
 	}
 }
 
-static void dctcp_cwnd_event(struct sock *sk, enum tcp_ca_event ev)
+static void inigo_cwnd_event(struct sock *sk, enum tcp_ca_event ev)
 {
 	switch (ev) {
 	case CA_EVENT_ECN_IS_CE:
@@ -277,68 +302,176 @@ static void dctcp_cwnd_event(struct sock *sk, enum tcp_ca_event ev)
 	}
 }
 
-static void dctcp_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
+void inigo_cong_avoid_ai(struct inigo *ca, struct tcp_sock *tp, u32 w)
 {
-	const struct dctcp *ca = inet_csk_ca(sk);
+	u32 alpha_old;
+
+	if (tp->snd_cwnd_cnt >= w) {
+		if (tp->snd_cwnd < tp->snd_cwnd_clamp)
+			tp->snd_cwnd++;
+
+		alpha_old = ca->rtt_alpha;
+
+		ca->rtt_alpha = ca->rtt_alpha -
+				(alpha_old >> dctcp_shift_g) +
+				(ca->delayed_cnt << (10U - dctcp_shift_g)) /
+				tp->snd_cwnd_cnt;
+
+		if (ca->rtt_alpha > DCTCP_MAX_ALPHA)
+			ca->rtt_alpha = DCTCP_MAX_ALPHA;
+
+		pr_debug_ratelimited("tcp_inigo: cong_avoid_ai: delayed_cnt=%u, w=%u, rtt_alpha=%u", ca->delayed_cnt, w, ca->rtt_alpha);
+		tp->snd_cwnd_cnt = 0;
+		ca->delayed_cnt = 0;
+	} else {
+		tp->snd_cwnd_cnt++;
+		pr_debug_ratelimited("tcp_inigo: cong_avoid_ai: snd_cwnd_cnt=%u, w=%u", tp->snd_cwnd_cnt, w);
+	}
+}
+
+void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
+{
+	struct inigo *ca = inet_csk_ca(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
+
+/* This seems to prevent both slowstart and congavoid ...
+	if (!tcp_is_cwnd_limited(sk)) {
+		pr_debug_ratelimited("tcp_inigo: cong_avoid: !tcp_is_cwnd_limited, snd_cwnd=%u, snd_ssthresh=%u, max_packets_out=%u", tp->snd_cwnd, tp->snd_ssthresh, tp->max_packets_out);
+		return;
+	}
+ */
+
+	/* In "safe" area, increase. */
+	if (tp->snd_cwnd <= tp->snd_ssthresh) {
+		tcp_slow_start(tp, acked);
+		pr_debug_ratelimited("tcp_inigo: cong_avoid: slowstart snd_cwnd=%u, snd_ssthresh=%u", tp->snd_cwnd, tp->snd_ssthresh);
+	/* In dangerous area, increase slowly. */
+	} else {
+		pr_debug_ratelimited("tcp_inigo: cong_avoid: congavoid snd_cwnd=%u, snd_ssthresh=%u", tp->snd_cwnd, tp->snd_ssthresh);
+		inigo_cong_avoid_ai(ca, tp, tp->snd_cwnd);
+	}
+}
+
+static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
+{
+	struct inigo *ca = inet_csk_ca(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	/* Some calls are for duplicates without timetamps */
+	if (rtt <= 0)
+		return;
+
+	ca->rtt_min = min((u32) rtt, ca->rtt_min);
+
+	/* Mimic DCTCP's ECN marking threshhold of approximately 0.17*BDP
+	 * 11/64 = 0.171875
+	 */
+	if ((u32) rtt > (ca->rtt_min + (11 * ca->rtt_min >> 6))) {
+		ca->delayed_cnt++;
+		pr_debug_ratelimited("tcp_inigo: pkts_acked: delayed_cnt=%u, snd_cwnd_cnt=%u", ca->delayed_cnt, tp->snd_cwnd_cnt);
+
+		/* Don't want to prematurely exit slowstart. 0.17*snd_cwnd >= 2 */
+		if (tp->snd_cwnd >= 18 &&
+		    tp->snd_cwnd <= tp->snd_ssthresh &&
+		    ca->delayed_cnt >= (11 * tp->snd_cwnd >> 6)) {
+			pr_debug_ratelimited("tcp_inigo: pkts_acked: set ssthresh delayed_cnt=%u, snd_cwnd=%u, thresh=%u", ca->delayed_cnt, tp->snd_cwnd, 11 * tp->snd_cwnd >> 6);
+			//NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPHYSTARTDELAYDETECT);
+			//NET_ADD_STATS_BH(sock_net(sk), LINUX_MIB_TCPHYSTARTDELAYCWND, tp->snd_cwnd);
+			tp->snd_ssthresh = tp->snd_cwnd;
+			ca->delayed_cnt = 0;
+		} else {
+			pr_debug_ratelimited("tcp_inigo: pkts_acked: leave ssthresh delayed_cnt=%u, snd_cwnd=%u, thresh=%u", ca->delayed_cnt, tp->snd_cwnd, 11 * tp->snd_cwnd >> 6);
+		}
+	} else {
+		pr_debug_ratelimited("tcp_inigo: pkts_acked: not delayed rtt=%d <= rtt_min=%u + thresh=%u", rtt, ca->rtt_min, (11 * ca->rtt_min >> 6));
+	}
+}
+
+/* Put in include/uapi/linux/inet_diag.h */
+/* INET_DIAG_INIGOINFO */
+
+#define INET_DIAG_INIGOINFO 10
+
+struct tcp_inigo_info {
+        __u16   dctcp_enabled;
+        __u16   dctcp_ce_state;
+        __u32   dctcp_alpha;
+        __u32   dctcp_ab_ecn;
+        __u32   dctcp_ab_tot;
+        __u32   rtt_min;
+        __u32   rtt_alpha;
+        __u32   delayed_cnt;
+};
+
+static void inigo_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+	const struct inigo *ca = inet_csk_ca(sk);
 
 	/* Fill it also in case of VEGASINFO due to req struct limits.
 	 * We can still correctly retrieve it later.
 	 */
-	if (ext & (1 << (INET_DIAG_DCTCPINFO - 1)) ||
+	if (ext & (1 << (INET_DIAG_INIGOINFO - 1)) ||
 	    ext & (1 << (INET_DIAG_VEGASINFO - 1))) {
-		struct tcp_dctcp_info info;
+		struct tcp_inigo_info info;
 
 		memset(&info, 0, sizeof(info));
-		if (inet_csk(sk)->icsk_ca_ops != &dctcp_reno) {
+		if ((tp->ecn_flags & TCP_ECN_OK)) {
 			info.dctcp_enabled = 1;
 			info.dctcp_ce_state = (u16) ca->ce_state;
 			info.dctcp_alpha = ca->dctcp_alpha;
 			info.dctcp_ab_ecn = ca->acked_bytes_ecn;
 			info.dctcp_ab_tot = ca->acked_bytes_total;
+			info.rtt_min = ca->rtt_min;
+			info.rtt_alpha = ca->rtt_alpha;
+			info.delayed_cnt = ca->delayed_cnt;
+		} else {
+			info.dctcp_enabled = 0;
+			info.dctcp_ce_state = (u16) 0;
+			info.dctcp_alpha = ca->dctcp_alpha;
+			info.dctcp_ab_ecn = ca->acked_bytes_ecn;
+			info.dctcp_ab_tot = ca->acked_bytes_total;
+			info.rtt_min = ca->rtt_min;
+			info.rtt_alpha = ca->rtt_alpha;
+			info.delayed_cnt = ca->delayed_cnt;
 		}
 
-		nla_put(skb, INET_DIAG_DCTCPINFO, sizeof(info), &info);
+		nla_put(skb, INET_DIAG_INIGOINFO, sizeof(info), &info);
 	}
 }
 
-static struct tcp_congestion_ops dctcp __read_mostly = {
-	.init		= dctcp_init,
-	.in_ack_event   = dctcp_update_alpha,
-	.cwnd_event	= dctcp_cwnd_event,
-	.ssthresh	= dctcp_ssthresh,
-	.cong_avoid	= tcp_reno_cong_avoid,
-	.set_state	= dctcp_state,
-	.get_info	= dctcp_get_info,
+static struct tcp_congestion_ops inigo __read_mostly = {
+	.init		= inigo_init,
+	.in_ack_event   = inigo_update_alpha,
+	.cwnd_event	= inigo_cwnd_event,
+	.ssthresh	= inigo_ssthresh,
+	.cong_avoid	= inigo_cong_avoid,
+	.pkts_acked 	= inigo_pkts_acked,
+	.set_state	= inigo_state,
+	.get_info	= inigo_get_info,
 	.flags		= TCP_CONG_NEEDS_ECN,
 	.owner		= THIS_MODULE,
-	.name		= "dctcp",
+	.name		= "inigo",
 };
 
-static struct tcp_congestion_ops dctcp_reno __read_mostly = {
-	.ssthresh	= tcp_reno_ssthresh,
-	.cong_avoid	= tcp_reno_cong_avoid,
-	.get_info	= dctcp_get_info,
-	.owner		= THIS_MODULE,
-	.name		= "dctcp-reno",
-};
-
-static int __init dctcp_register(void)
+static int __init inigo_register(void)
 {
-	BUILD_BUG_ON(sizeof(struct dctcp) > ICSK_CA_PRIV_SIZE);
-	return tcp_register_congestion_control(&dctcp);
+	BUILD_BUG_ON(sizeof(struct inigo) > ICSK_CA_PRIV_SIZE);
+	return tcp_register_congestion_control(&inigo);
 }
 
-static void __exit dctcp_unregister(void)
+static void __exit inigo_unregister(void)
 {
-	tcp_unregister_congestion_control(&dctcp);
+	tcp_unregister_congestion_control(&inigo);
 }
 
-module_init(dctcp_register);
-module_exit(dctcp_unregister);
+module_init(inigo_register);
+module_exit(inigo_unregister);
 
+MODULE_AUTHOR("Andrew Shewmaker <ashewmaker@gmail.com>");
 MODULE_AUTHOR("Daniel Borkmann <dborkman@redhat.com>");
 MODULE_AUTHOR("Florian Westphal <fw@strlen.de>");
 MODULE_AUTHOR("Glenn Judd <glenn.judd@morganstanley.com>");
 
 MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("DataCenter TCP (DCTCP)");
+MODULE_DESCRIPTION("TCP Inigo");
