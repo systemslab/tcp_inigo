@@ -112,6 +112,11 @@ static void inigo_init(struct sock *sk)
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct inigo *ca = inet_csk_ca(sk);
 
+	ca->rtt_min = USEC_PER_SEC;
+	ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
+	ca->delayed_cnt = 0;
+	ca->ack_total = 0;
+
 	if ((tp->ecn_flags & TCP_ECN_OK) ||
 	    (sk->sk_state == TCP_LISTEN ||
 	     sk->sk_state == TCP_CLOSE)) {
@@ -119,9 +124,6 @@ static void inigo_init(struct sock *sk)
 		ca->prior_rcv_nxt = tp->rcv_nxt;
 
 		ca->dctcp_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
-
-		ca->rtt_min = USEC_PER_SEC;
-		ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
 
 		ca->delayed_ack_reserved = 0;
 		ca->ce_state = 0;
@@ -134,7 +136,6 @@ static void inigo_init(struct sock *sk)
 	 * Also need to clear ECT from sk since it is set during 3WHS for DCTCP.
 	 */
 	ca->dctcp_alpha = 0;
-	ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
 	INET_ECN_dontxmit(sk);
 }
 
