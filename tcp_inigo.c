@@ -79,6 +79,7 @@ struct inigo {
 	u32 rtt_min;
 	u32 rtt_alpha;
 	u32 delayed_cnt;
+	u32 ack_total;
 };
 
 static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
@@ -93,6 +94,10 @@ static unsigned int dctcp_clamp_alpha_on_loss __read_mostly;
 module_param(dctcp_clamp_alpha_on_loss, uint, 0644);
 MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 		 "parameter for clamping alpha on loss");
+
+static unsigned int markthresh __read_mostly = 180;
+module_param(markthresh, uint, 0644);
+MODULE_PARM_DESC(markthresh, "delay marking threshhold, default=180 out of 1024");
 
 static unsigned int debug_dport __read_mostly = 0;
 module_param(debug_dport, uint, 0644);
@@ -128,8 +133,8 @@ static void inigo_init(struct sock *sk)
 
 		dctcp_reset(tp, ca);
 
-		pr_info("tcp_inigo: init: dctcp enabled. %pI4:d%u, snd_cwnd=%u, snd_ssthresh=%u, alphas=%u/%u",
-			&inet->inet_saddr, ntohs(inet->inet_dport), tp->snd_cwnd, tp->snd_ssthresh, ca->dctcp_alpha, ca->rtt_alpha);
+		pr_info("tcp_inigo: init: dctcp enabled. %pI4:d%u, snd_cwnd=%u, snd_ssthresh=%u, markthresh=%u/1024, alphas=%u/%u",
+			&inet->inet_saddr, ntohs(inet->inet_dport), tp->snd_cwnd, tp->snd_ssthresh, markthresh, ca->dctcp_alpha, ca->rtt_alpha);
 		return;
 	}
 
@@ -140,8 +145,8 @@ static void inigo_init(struct sock *sk)
 	ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
 	INET_ECN_dontxmit(sk);
 
-	pr_info("tcp_inigo: init: dctcp disabled. %pI4:d%u, snd_cwnd=%u, snd_ssthresh=%u, alphas=%u/%u",
-		&inet->inet_saddr, ntohs(inet->inet_dport), tp->snd_cwnd, tp->snd_ssthresh, ca->dctcp_alpha, ca->rtt_alpha);
+	pr_info("tcp_inigo: init: dctcp disabled. %pI4:d%u, snd_cwnd=%u, snd_ssthresh=%u, markthresh=%u/1024, alphas=%u/%u",
+		&inet->inet_saddr, ntohs(inet->inet_dport), tp->snd_cwnd, tp->snd_ssthresh, markthresh, ca->dctcp_alpha, ca->rtt_alpha);
 }
 
 static u32 inigo_ssthresh(struct sock *sk)
@@ -318,8 +323,47 @@ static void inigo_cwnd_event(struct sock *sk, enum tcp_ca_event ev)
 	}
 }
 
-void inigo_cong_avoid_ai(struct inigo *ca, struct tcp_sock *tp, const struct inet_sock *inet, u32 w)
+/* The cwnd reduction in CWR and Recovery use the PRR algorithm
+ * https://datatracker.ietf.org/doc/draft-ietf-tcpm-proportional-rate-reduction/
+ * It computes the number of packets to send (sndcnt) based on packets newly
+ * delivered:
+ *   1) If the packets in flight is larger than ssthresh, PRR spreads the
+ *      cwnd reductions across a full RTT.
+ *   2) If packets in flight is lower than ssthresh (such as due to excess
+ *      losses and/or application stalls), do not perform any further cwnd
+ *      reductions, but instead slow start up to ssthresh.
+ */
+static void tcp_init_cwnd_reduction(struct sock *sk)
 {
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tp->high_seq = tp->snd_nxt;
+	tp->tlp_high_seq = 0;
+	tp->snd_cwnd_cnt = 0;
+	tp->prior_cwnd = tp->snd_cwnd;
+	tp->prr_delivered = 0;
+	tp->prr_out = 0;
+	tp->snd_ssthresh = inigo_ssthresh(sk);
+}
+
+/* Enter CWR state. Disable cwnd undo since congestion is proven with ECN or Delay */
+void tcp_enter_cwr(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tp->prior_ssthresh = 0;
+	if (inet_csk(sk)->icsk_ca_state < TCP_CA_CWR) {
+		tp->undo_marker = 0;
+		tcp_init_cwnd_reduction(sk);
+		tcp_set_ca_state(sk, TCP_CA_CWR);
+	}
+}
+
+void inigo_cong_avoid_ai(struct sock *sk, u32 w)
+{
+	struct inigo *ca = inet_csk_ca(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
+	const struct inet_sock *inet = inet_sk(sk);
 	u32 alpha_old;
 
 	if (tp->snd_cwnd_cnt >= w) {
@@ -331,17 +375,20 @@ void inigo_cong_avoid_ai(struct inigo *ca, struct tcp_sock *tp, const struct ine
 		ca->rtt_alpha = ca->rtt_alpha -
 				(alpha_old >> dctcp_shift_g) +
 				(ca->delayed_cnt << (10U - dctcp_shift_g)) /
-				tp->snd_cwnd_cnt;
+				ca->ack_total;
 
 		if (ca->rtt_alpha > DCTCP_MAX_ALPHA)
 			ca->rtt_alpha = DCTCP_MAX_ALPHA;
 
 		if (ntohs(inet->inet_dport) == debug_dport)
-			pr_debug_ratelimited("tcp_inigo: cong_avoid_ai: %pI4, delayed_cnt=%u, w=%u, rtt_alpha=%u",
-				&inet->inet_saddr, ca->delayed_cnt, w, ca->rtt_alpha);
+			pr_debug_ratelimited("tcp_inigo: cong_avoid_ai: %pI4, delayed_cnt=%u, ack_total=%u, rtt_alpha=%u, rtt_min=%u",
+				&inet->inet_saddr, ca->delayed_cnt, ca->ack_total, ca->rtt_alpha, ca->rtt_min);
 
-		tp->snd_cwnd_cnt = 0;
+		if (ca->rtt_alpha > 0)
+			tcp_enter_cwr(sk);
+
 		ca->delayed_cnt = 0;
+		ca->ack_total = 0;
 	} else {
 		tp->snd_cwnd_cnt++;
 
@@ -353,19 +400,16 @@ void inigo_cong_avoid_ai(struct inigo *ca, struct tcp_sock *tp, const struct ine
 
 void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 {
-	struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	const struct inet_sock *inet = inet_sk(sk);
 	bool debug = ntohs(inet->inet_dport) == debug_dport;
 
-/* This seems to prevent both slowstart and congavoid ...
 	if (!tcp_is_cwnd_limited(sk)) {
 		if (debug)
-			pr_debug_ratelimited("tcp_inigo: cong_avoid: !tcp_is_cwnd_limited. %pI4:d%u, snd_cwnd=%u, snd_ssthresh=%u, max_packets_out=%u",
+			pr_debug_ratelimited("tcp_inigo: cong_avoid: !tcp_is_cwnd_limited. %pI4, snd_cwnd=%u, snd_ssthresh=%u, max_packets_out=%u",
 				&inet->inet_saddr, tp->snd_cwnd, tp->snd_ssthresh, tp->max_packets_out);
 		return;
 	}
- */
 
 	/* In "safe" area, increase. */
 	if (tp->snd_cwnd <= tp->snd_ssthresh) {
@@ -380,7 +424,7 @@ void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 			pr_debug_ratelimited("tcp_inigo: cong_avoid: congavoid. %pI4:d%u, snd_cwnd=%u, snd_ssthresh=%u",
 				&inet->inet_saddr, ntohs(inet->inet_dport), tp->snd_cwnd, tp->snd_ssthresh);
 
-		inigo_cong_avoid_ai(ca, tp, inet, tp->snd_cwnd);
+		inigo_cong_avoid_ai(sk, tp->snd_cwnd);
 	}
 }
 
@@ -395,38 +439,40 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 	if (rtt <= 0)
 		return;
 
-	ca->rtt_min = min((u32) rtt, ca->rtt_min);
+	ca->ack_total++;
 
-	/* Mimic DCTCP's ECN marking threshhold of approximately 0.17*BDP
-	 * 11/64 = 0.171875
-	 */
-	if ((u32) rtt > (ca->rtt_min + (11 * ca->rtt_min >> 6))) {
+	ca->rtt_min = min((u32) rtt, ca->rtt_min);
+	if (ca->rtt_min < 10) {
+		pr_info("rtt_min too low! rtt=%u, rtt_min=%u", (u32) rtt, ca->rtt_min);
+		ca->rtt_min = rtt;
+	}
+
+	/* Mimic DCTCP's ECN marking threshhold of approximately 0.17*BDP */
+	if ((u32) rtt > (ca->rtt_min + (markthresh * ca->rtt_min / 1024U))) {
 		ca->delayed_cnt++;
 
 		if (debug)
-			pr_debug_ratelimited("tcp_inigo: pkts_acked: %pI4, delayed_cnt=%u, snd_cwnd_cnt=%u",
-				&inet->inet_saddr, ca->delayed_cnt, tp->snd_cwnd_cnt);
+			pr_debug_ratelimited("tcp_inigo: pkts_acked: delay mark. %pI4, delayed_cnt=%u, ack_total=%u, rtt_min=%u, rtt=%u, thresh=%u",
+				&inet->inet_saddr, ca->delayed_cnt, ca->ack_total, ca->rtt_min, (u32) rtt, (markthresh * ca->rtt_min / 1024U));
 
-		/* Don't want to prematurely exit slowstart. 0.17*snd_cwnd >= 2 */
-		if (tp->snd_cwnd >= 18 &&
+		/* Don't want to prematurely exit slowstart. 0.17*ack_total > 3 */
+		if ((ca->ack_total * markthresh / 1024U) > 3 &&
 		    tp->snd_cwnd <= tp->snd_ssthresh &&
-		    ca->delayed_cnt >= (11 * tp->snd_cwnd >> 6)) {
+		    ca->delayed_cnt >= (ca->ack_total * markthresh / 1024U)) {
 			if (debug)
-				pr_debug_ratelimited("tcp_inigo: pkts_acked: %pI4, set ssthresh. delayed_cnt=%u, snd_cwnd=%u, thresh=%u",
-					&inet->inet_saddr, ca->delayed_cnt, tp->snd_cwnd, 11 * tp->snd_cwnd >> 6);
-			//NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPHYSTARTDELAYDETECT);
-			//NET_ADD_STATS_BH(sock_net(sk), LINUX_MIB_TCPHYSTARTDELAYCWND, tp->snd_cwnd);
+				pr_debug_ratelimited("tcp_inigo: pkts_acked: %pI4, set ssthresh. delayed_cnt=%u, ack_total=%u, thresh=%u",
+					&inet->inet_saddr, ca->delayed_cnt, ca->ack_total, markthresh * ca->ack_total / 1024U);
 			tp->snd_ssthresh = tp->snd_cwnd;
 			ca->delayed_cnt = 0;
 		} else {
 			if (debug)
-				pr_debug_ratelimited("tcp_inigo: pkts_acked: %pI4, keep ssthresh. delayed_cnt=%u, snd_cwnd=%u, thresh=%u",
-					&inet->inet_saddr, ca->delayed_cnt, tp->snd_cwnd, 11 * tp->snd_cwnd >> 6);
+				pr_debug_ratelimited("tcp_inigo: pkts_acked: %pI4, keep ssthresh. delayed_cnt=%u, ack_total=%u, thresh=%u",
+					&inet->inet_saddr, ca->delayed_cnt, ca->ack_total, markthresh * ca->ack_total / 1024U);
 		}
 	} else {
 		if (debug)
 			pr_debug_ratelimited("tcp_inigo: pkts_acked: %pI4, not delayed. rtt=%d <= rtt_min=%u + thresh=%u",
-				&inet->inet_saddr, rtt, ca->rtt_min, (11 * ca->rtt_min >> 6));
+				&inet->inet_saddr, rtt, ca->rtt_min, (markthresh * ca->rtt_min / 1024U));
 	}
 }
 
@@ -436,14 +482,14 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 #define INET_DIAG_INIGOINFO 10
 
 struct tcp_inigo_info {
-        __u16   dctcp_enabled;
-        __u16   dctcp_ce_state;
-        __u32   dctcp_alpha;
-        __u32   dctcp_ab_ecn;
-        __u32   dctcp_ab_tot;
-        __u32   rtt_min;
-        __u32   rtt_alpha;
-        __u32   delayed_cnt;
+	__u16   dctcp_enabled;
+	__u16   dctcp_ce_state;
+	__u32   dctcp_alpha;
+	__u32   dctcp_ab_ecn;
+	__u32   dctcp_ab_tot;
+	__u32   rtt_min;
+	__u32   rtt_alpha;
+	__u32   delayed_cnt;
 };
 
 static void inigo_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
