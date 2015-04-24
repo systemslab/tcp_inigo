@@ -111,7 +111,6 @@ static void inigo_init(struct sock *sk)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct inigo *ca = inet_csk_ca(sk);
-	const struct inet_sock *inet = inet_sk(sk);
 
 	if ((tp->ecn_flags & TCP_ECN_OK) ||
 	    (sk->sk_state == TCP_LISTEN ||
@@ -128,9 +127,6 @@ static void inigo_init(struct sock *sk)
 		ca->ce_state = 0;
 
 		dctcp_reset(tp, ca);
-
-		pr_info("tcp_inigo: init: dctcp enabled. %pI4:d%u, snd_cwnd=%u, snd_ssthresh=%u, markthresh=%u/1024, alphas=%u/%u",
-			&inet->inet_saddr, ntohs(inet->inet_dport), tp->snd_cwnd, tp->snd_ssthresh, markthresh, ca->dctcp_alpha, ca->rtt_alpha);
 		return;
 	}
 
@@ -140,16 +136,12 @@ static void inigo_init(struct sock *sk)
 	ca->dctcp_alpha = 0;
 	ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
 	INET_ECN_dontxmit(sk);
-
-	pr_info("tcp_inigo: init: dctcp disabled. %pI4:d%u, snd_cwnd=%u, snd_ssthresh=%u, markthresh=%u/1024, alphas=%u/%u",
-		&inet->inet_saddr, ntohs(inet->inet_dport), tp->snd_cwnd, tp->snd_ssthresh, markthresh, ca->dctcp_alpha, ca->rtt_alpha);
 }
 
 static u32 inigo_ssthresh(struct sock *sk)
 {
 	const struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	const struct inet_sock *inet = inet_sk(sk);
 	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
 
 	return max(tp->snd_cwnd - ((tp->snd_cwnd * alpha) >> 11U), 2U);
@@ -355,7 +347,6 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w)
 {
 	struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	const struct inet_sock *inet = inet_sk(sk);
 	u32 alpha_old;
 
 	if (tp->snd_cwnd_cnt >= w) {
@@ -385,7 +376,6 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w)
 void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
-	const struct inet_sock *inet = inet_sk(sk);
 
 	if (!tcp_is_cwnd_limited(sk)) {
 		return;
@@ -404,7 +394,6 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 {
 	struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	const struct inet_sock *inet = inet_sk(sk);
 
 	/* Some calls are for duplicates without timetamps */
 	if (rtt <= 0)
