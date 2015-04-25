@@ -83,8 +83,8 @@ struct inigo {
 	u32 delayed_ack_reserved;
 	u32 rtt_min;
 	u32 rtt_alpha;
-	u32 delayed_cnt;
-	u32 ack_total;
+	u32 rtts_late;
+	u32 rtts_total;
 };
 
 static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
@@ -135,8 +135,8 @@ static void inigo_init(struct sock *sk)
 
 	ca->rtt_min = USEC_PER_SEC;
 	ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
-	ca->delayed_cnt = 0;
-	ca->ack_total = 0;
+	ca->rtts_late = 0;
+	ca->rtts_total = 0;
 
 	if ((tp->ecn_flags & TCP_ECN_OK) ||
 	    (sk->sk_state == TCP_LISTEN ||
@@ -278,14 +278,14 @@ static void inigo_update_rtt_alpha(struct inigo *ca)
 {
 	ca->rtt_alpha = ca->rtt_alpha -
 			(ca->rtt_alpha >> dctcp_shift_g) +
-			(ca->delayed_cnt << (10U - dctcp_shift_g)) /
-			ca->ack_total;
+			(ca->rtts_late << (10U - dctcp_shift_g)) /
+			ca->rtts_total;
 
 	if (ca->rtt_alpha > DCTCP_MAX_ALPHA)
 		ca->rtt_alpha = DCTCP_MAX_ALPHA;
 
-	ca->delayed_cnt = 0;
-	ca->ack_total = 0;
+	ca->rtts_late = 0;
+	ca->rtts_total = 0;
 }
 
 static void inigo_state(struct sock *sk, u8 new_state)
@@ -438,7 +438,7 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 	if (rtt <= 0)
 		return;
 
-	ca->ack_total++;
+	ca->rtts_total++;
 
 	ca->rtt_min = min((u32) rtt, ca->rtt_min);
 	if (ca->rtt_min < 10) {
@@ -448,14 +448,14 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 
 	/* Mimic DCTCP's ECN marking threshhold of approximately 0.17*BDP */
 	if ((u32) rtt > (ca->rtt_min + (markthresh * ca->rtt_min / 1024U))) {
-		ca->delayed_cnt++;
+		ca->rtts_late++;
 
-		/* Don't want to prematurely exit slowstart. 0.17*ack_total > 3 */
-		if ((ca->ack_total * markthresh / 1024U) > 3 &&
+		/* Don't want to prematurely exit slowstart. 0.17*rtts_total > 3 */
+		if ((ca->rtts_total * markthresh / 1024U) > 3 &&
 		    tp->snd_cwnd <= tp->snd_ssthresh &&
-		    ca->delayed_cnt >= (ca->ack_total * markthresh / 1024U)) {
+		    ca->rtts_late >= (ca->rtts_total * markthresh / 1024U)) {
 			tp->snd_ssthresh = tp->snd_cwnd;
-			ca->delayed_cnt = 0;
+			ca->rtts_late = 0;
 		}
 	}
 }
@@ -473,8 +473,8 @@ struct tcp_inigo_info {
 	__u32   dctcp_ab_tot;
 	__u32   rtt_min;
 	__u32   rtt_alpha;
-	__u32   delayed_cnt;
-	__u32   ack_total;
+	__u32   rtts_late;
+	__u32   rtts_total;
 };
 
 static void inigo_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
@@ -498,8 +498,8 @@ static void inigo_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
 			info.dctcp_ab_tot = ca->acked_bytes_total;
 			info.rtt_min = ca->rtt_min;
 			info.rtt_alpha = ca->rtt_alpha;
-			info.delayed_cnt = ca->delayed_cnt;
-			info.ack_total = ca->ack_total;
+			info.rtts_late = ca->rtts_late;
+			info.rtts_total = ca->rtts_total;
 		} else {
 			info.dctcp_enabled = 0;
 			info.dctcp_ce_state = (u16) 0;
@@ -508,8 +508,8 @@ static void inigo_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
 			info.dctcp_ab_tot = ca->acked_bytes_total;
 			info.rtt_min = ca->rtt_min;
 			info.rtt_alpha = ca->rtt_alpha;
-			info.delayed_cnt = ca->delayed_cnt;
-			info.ack_total = ca->ack_total;
+			info.rtts_late = ca->rtts_late;
+			info.rtts_total = ca->rtts_total;
 		}
 
 		nla_put(skb, INET_DIAG_INIGOINFO, sizeof(info), &info);
