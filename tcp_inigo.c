@@ -2,11 +2,14 @@
  *
  * This is an implementation of TCP Inigo, which takes the measure of
  * the extent of congestion introduced in DCTCP and applies it to
- * networks outside the data center, including wireless.
+ * networks outside the data center.
  *
  * https://www.soe.ucsc.edu/research/technical-reports/UCSC-SOE-14-14
  *
- * The motivation behind the "dampen" functionality comes from:
+ * The motivation behind the RTT fairness functionality comes from
+ * the 2nd DCTCP paper listed below.
+ *
+ * The motivation behind the stabilize functionality comes from:
  *
  * Alizadeh, Mohammad, et al.
  * "Stability analysis of QCN: the averaging principle."
@@ -66,6 +69,8 @@
 #include <linux/inet_diag.h>
 
 #define DCTCP_MAX_ALPHA	1024U
+#define MIN_RTT_FAIRNESS_INTERVAL 4U
+#define MAX_RTT_FAIRNESS_INTERVAL 4U
 
 struct inigo {
 	u32 acked_bytes_ecn;
@@ -86,18 +91,29 @@ static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
 module_param(dctcp_shift_g, uint, 0644);
 MODULE_PARM_DESC(dctcp_shift_g, "parameter g for updating dctcp_alpha");
 
-static unsigned int dctcp_alpha_on_init __read_mostly = DCTCP_MAX_ALPHA;
+static unsigned int dctcp_alpha_on_init __read_mostly = 0;
 module_param(dctcp_alpha_on_init, uint, 0644);
-MODULE_PARM_DESC(dctcp_alpha_on_init, "parameter for initial alpha value");
+MODULE_PARM_DESC(dctcp_alpha_on_init, "parameter for initial alpha value, defaults to 0");
 
 static unsigned int dctcp_clamp_alpha_on_loss __read_mostly;
 module_param(dctcp_clamp_alpha_on_loss, uint, 0644);
 MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 		 "parameter for clamping alpha on loss");
 
-static unsigned int markthresh __read_mostly = 180;
+static unsigned int markthresh __read_mostly = 360;
 module_param(markthresh, uint, 0644);
-MODULE_PARM_DESC(markthresh, "delay marking threshhold, default=180 out of 1024");
+MODULE_PARM_DESC(markthresh, "delay marking threshhold, default=360 out of 1024");
+
+static u32 rtt_fairness  __read_mostly = 10;
+module_param(rtt_fairness, uint, 0644);
+MODULE_PARM_DESC(rtt_fairness, "If non-zero, react to congestion every x acks,"
+		 " 3 < x < 101. Defaults to 10, indicating once per window");
+
+static bool stabilize  __read_mostly = true;
+module_param(stabilize, bool, 0644);
+MODULE_PARM_DESC(stabilize, "stabilize congestion response by alternating normal response"
+			 " with averaged response, defaults to true");
+
 
 static void dctcp_reset(const struct tcp_sock *tp, struct inigo *ca)
 {
@@ -111,6 +127,11 @@ static void inigo_init(struct sock *sk)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct inigo *ca = inet_csk_ca(sk);
+
+	if (rtt_fairness != 0) {
+		rtt_fairness = max(rtt_fairness, MIN_RTT_FAIRNESS_INTERVAL);
+		rtt_fairness = min(rtt_fairness, MAX_RTT_FAIRNESS_INTERVAL);
+	}
 
 	ca->rtt_min = USEC_PER_SEC;
 	ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
@@ -214,7 +235,7 @@ static void dctcp_ce_state_1_to_0(struct sock *sk)
 	tp->ecn_flags &= ~TCP_ECN_DEMAND_CWR;
 }
 
-static void inigo_update_alpha(struct sock *sk, u32 flags)
+static void inigo_update_dctcp_alpha(struct sock *sk, u32 flags)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct inigo *ca = inet_csk_ca(sk);
@@ -251,6 +272,20 @@ static void inigo_update_alpha(struct sock *sk, u32 flags)
 
 		dctcp_reset(tp, ca);
 	}
+}
+
+static void inigo_update_rtt_alpha(struct inigo *ca)
+{
+	ca->rtt_alpha = ca->rtt_alpha -
+			(ca->rtt_alpha >> dctcp_shift_g) +
+			(ca->delayed_cnt << (10U - dctcp_shift_g)) /
+			ca->ack_total;
+
+	if (ca->rtt_alpha > DCTCP_MAX_ALPHA)
+		ca->rtt_alpha = DCTCP_MAX_ALPHA;
+
+	ca->delayed_cnt = 0;
+	ca->ack_total = 0;
 }
 
 static void inigo_state(struct sock *sk, u8 new_state)
@@ -348,28 +383,31 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w)
 {
 	struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	u32 alpha_old;
+	u32 interval;
 
 	if (tp->snd_cwnd_cnt >= w) {
 		if (tp->snd_cwnd < tp->snd_cwnd_clamp)
 			tp->snd_cwnd++;
+	}
 
-		alpha_old = ca->rtt_alpha;
+	if (tp->snd_cwnd_cnt > MIN_RTT_FAIRNESS_INTERVAL) {
+		if (rtt_fairness == 0)
+			interval = w;
+		else
+			interval = rtt_fairness;
 
-		ca->rtt_alpha = ca->rtt_alpha -
-				(alpha_old >> dctcp_shift_g) +
-				(ca->delayed_cnt << (10U - dctcp_shift_g)) /
-				ca->ack_total;
+		if (tp->snd_cwnd_cnt % interval == 0 || tp->snd_cwnd_cnt >= w) {
+			inigo_update_rtt_alpha(ca);
 
-		if (ca->rtt_alpha > DCTCP_MAX_ALPHA)
-			ca->rtt_alpha = DCTCP_MAX_ALPHA;
+			if (ca->rtt_alpha > 0)
+				tcp_enter_cwr(sk);
+		}
+		else if (stabilize && tp->snd_cwnd_cnt % (interval>>1) == 0) {
+			tp->snd_cwnd = (tp->prior_cwnd + w + 1)/2;
+		}
+	}
 
-		if (ca->rtt_alpha > 0)
-			tcp_enter_cwr(sk);
-
-		ca->delayed_cnt = 0;
-		ca->ack_total = 0;
-	} else {
+	if (tp->snd_cwnd_cnt < w) {
 		tp->snd_cwnd_cnt++;
 	}
 }
@@ -480,7 +518,7 @@ static void inigo_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
 
 static struct tcp_congestion_ops inigo __read_mostly = {
 	.init		= inigo_init,
-	.in_ack_event   = inigo_update_alpha,
+	.in_ack_event   = inigo_update_dctcp_alpha,
 	.cwnd_event	= inigo_cwnd_event,
 	.ssthresh	= inigo_ssthresh,
 	.cong_avoid	= inigo_cong_avoid,
