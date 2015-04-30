@@ -6,7 +6,18 @@ the extent of congestion introduced in DCTCP and applies it to
 networks outside the data center.
 
 [TCP Inigo: Fighting Congestion With Both Hands](https://www.soe.ucsc.edu/research/technical-reports/UCSC-SOE-14-14)
-describes the enhancements being pursued in this project.
+describes the enhancements being pursued in this project. At this
+point, only the RTT-based congestion control, RTT-fairness, and
+stability enhancements have been implemented.
+
+[Mininet tests for TCP Inigo](https://github.com/systemslab/mininet-tests/tree/inigo)
+include the basic Iperf incast test that was done by the [Mininet](http://mininet.org)
+folks for DCTCP, as well as the ability run
+[Flent, aka netperf-wrapper](https://github.com/tohojo/netperf-wrapper) tests.
+
+[Experiments](https://github.com/systemslab/tcp_inigo_experiments)
+show that TCP Inigo is able to keep queue depths at DCTCP levels using only
+RTTs as a signal of congestion. And Inigo can use both.
 
 The motivation behind the RTT fairness functionality comes from
 the 2nd DCTCP paper listed below.
