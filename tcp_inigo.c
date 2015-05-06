@@ -69,8 +69,8 @@
 #include <linux/inet_diag.h>
 
 #define DCTCP_MAX_ALPHA	1024U
-#define MIN_RTT_FAIRNESS_INTERVAL 4U
-#define MAX_RTT_FAIRNESS_INTERVAL 4U
+#define INIGO_MIN_FAIRNESS 4U
+#define INIGO_MAX_FAIRNESS 100U
 
 struct inigo {
 	u32 acked_bytes_ecn;
@@ -104,10 +104,10 @@ static unsigned int markthresh __read_mostly = 360;
 module_param(markthresh, uint, 0644);
 MODULE_PARM_DESC(markthresh, "delay marking threshhold, default=360 out of 1024");
 
-static u32 rtt_fairness  __read_mostly = 10;
+static u32 rtt_fairness  __read_mostly = 0;
 module_param(rtt_fairness, uint, 0644);
 MODULE_PARM_DESC(rtt_fairness, "If non-zero, react to congestion every x acks,"
-		 " 3 < x < 101. Defaults to 10, indicating once per window");
+		 " 3 < x < 101. Defaults to 0, indicating once per window");
 
 static bool stabilize  __read_mostly = true;
 module_param(stabilize, bool, 0644);
@@ -128,10 +128,8 @@ static void inigo_init(struct sock *sk)
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct inigo *ca = inet_csk_ca(sk);
 
-	if (rtt_fairness != 0) {
-		rtt_fairness = max(rtt_fairness, MIN_RTT_FAIRNESS_INTERVAL);
-		rtt_fairness = min(rtt_fairness, MAX_RTT_FAIRNESS_INTERVAL);
-	}
+	if (rtt_fairness != 0)
+		rtt_fairness = clamp(rtt_fairness, INIGO_MIN_FAIRNESS, INIGO_MAX_FAIRNESS);
 
 	ca->rtt_min = USEC_PER_SEC;
 	ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
@@ -165,6 +163,11 @@ static u32 inigo_ssthresh(struct sock *sk)
 	const struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
+
+	if (rtt_fairness &&
+	    tp->snd_cwnd_cnt > INIGO_MIN_FAIRNESS &&
+	    tp->snd_cwnd_cnt % rtt_fairness == 0)
+		return max(tp->snd_cwnd - ((tp->snd_cwnd * alpha) >> 11U) / rtt_fairness, 2U);
 
 	return max(tp->snd_cwnd - ((tp->snd_cwnd * alpha) >> 11U), 2U);
 }
@@ -379,7 +382,7 @@ void tcp_enter_cwr(struct sock *sk)
 	}
 }
 
-void inigo_cong_avoid_ai(struct sock *sk, u32 w)
+void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 {
 	struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -390,7 +393,7 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w)
 			tp->snd_cwnd++;
 	}
 
-	if (tp->snd_cwnd_cnt > MIN_RTT_FAIRNESS_INTERVAL) {
+	if (tp->snd_cwnd_cnt > INIGO_MIN_FAIRNESS) {
 		if (rtt_fairness == 0)
 			interval = w;
 		else
@@ -402,13 +405,13 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w)
 			if (ca->rtt_alpha > 0)
 				tcp_enter_cwr(sk);
 		}
-		else if (stabilize && tp->snd_cwnd_cnt % (interval>>1) == 0) {
+		else if (stabilize && tp->snd_cwnd_cnt % (interval >> 1) == 0) {
 			tp->snd_cwnd = (tp->prior_cwnd + w + 1)/2;
 		}
 	}
 
 	if (tp->snd_cwnd_cnt < w) {
-		tp->snd_cwnd_cnt++;
+		tp->snd_cwnd_cnt += acked;
 	}
 }
 
@@ -425,7 +428,7 @@ void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 		tcp_slow_start(tp, acked);
 	/* In dangerous area, increase slowly. */
 	} else {
-		inigo_cong_avoid_ai(sk, tp->snd_cwnd);
+		inigo_cong_avoid_ai(sk, tp->snd_cwnd, acked);
 	}
 }
 
