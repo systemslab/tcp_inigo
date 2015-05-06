@@ -71,6 +71,7 @@
 #define DCTCP_MAX_ALPHA	1024U
 #define INIGO_MIN_FAIRNESS 4U
 #define INIGO_MAX_FAIRNESS 100U
+#define INIGO_MAX_MARK 1024U
 
 struct inigo {
 	u32 acked_bytes_ecn;
@@ -93,26 +94,37 @@ MODULE_PARM_DESC(dctcp_shift_g, "parameter g for updating dctcp_alpha");
 
 static unsigned int dctcp_alpha_on_init __read_mostly = 0;
 module_param(dctcp_alpha_on_init, uint, 0644);
-MODULE_PARM_DESC(dctcp_alpha_on_init, "parameter for initial alpha value, defaults to 0");
+MODULE_PARM_DESC(dctcp_alpha_on_init, "parameter for initial alpha value, "
+		 " defaults to 0 out of 1024");
 
 static unsigned int dctcp_clamp_alpha_on_loss __read_mostly;
 module_param(dctcp_clamp_alpha_on_loss, uint, 0644);
 MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 		 "parameter for clamping alpha on loss");
 
-static unsigned int markthresh __read_mostly = 360;
-module_param(markthresh, uint, 0644);
-MODULE_PARM_DESC(markthresh, "delay marking threshhold, default=360 out of 1024");
+static unsigned int suspect_rtt  __read_mostly = 10;
+module_param(suspect_rtt, uint, 0644);
+MODULE_PARM_DESC(suspect_rtt, "throw out RTTs smaller than X microseconds,"
+		 " defaults to 10");
 
-static u32 rtt_fairness  __read_mostly = 0;
+static unsigned int markthresh __read_mostly = 180;
+module_param(markthresh, uint, 0644);
+MODULE_PARM_DESC(markthresh, "delay marking threshhold, default=180 out of 1024");
+
+static unsigned int min_rtt_samples_needed __read_mostly = 5;
+module_param(min_rtt_samples_needed, uint, 0644);
+MODULE_PARM_DESC(min_rtt_samples_needed, "minimum number of RTT samples needed"
+		 " to exit slowstart, default=5");
+
+static unsigned int rtt_fairness  __read_mostly = 0;
 module_param(rtt_fairness, uint, 0644);
 MODULE_PARM_DESC(rtt_fairness, "If non-zero, react to congestion every x acks,"
 		 " 3 < x < 101. Defaults to 0, indicating once per window");
 
-static bool stabilize  __read_mostly = true;
+static bool stabilize  __read_mostly = false;
 module_param(stabilize, bool, 0644);
 MODULE_PARM_DESC(stabilize, "stabilize congestion response by alternating normal response"
-			 " with averaged response, defaults to true");
+			 " with averaged response, defaults to false");
 
 
 static void dctcp_reset(const struct tcp_sock *tp, struct inigo *ca)
@@ -356,7 +368,7 @@ static void inigo_cwnd_event(struct sock *sk, enum tcp_ca_event ev)
  *      losses and/or application stalls), do not perform any further cwnd
  *      reductions, but instead slow start up to ssthresh.
  */
-static void tcp_init_cwnd_reduction(struct sock *sk)
+static void inigo_init_cwnd_reduction(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
@@ -370,14 +382,14 @@ static void tcp_init_cwnd_reduction(struct sock *sk)
 }
 
 /* Enter CWR state. Disable cwnd undo since congestion is proven with ECN or Delay */
-void tcp_enter_cwr(struct sock *sk)
+void inigo_enter_cwr(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 
 	tp->prior_ssthresh = 0;
 	if (inet_csk(sk)->icsk_ca_state < TCP_CA_CWR) {
 		tp->undo_marker = 0;
-		tcp_init_cwnd_reduction(sk);
+		inigo_init_cwnd_reduction(sk);
 		tcp_set_ca_state(sk, TCP_CA_CWR);
 	}
 }
@@ -403,7 +415,7 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 			inigo_update_rtt_alpha(ca);
 
 			if (ca->rtt_alpha > 0)
-				tcp_enter_cwr(sk);
+				inigo_enter_cwr(sk);
 		}
 		else if (stabilize && tp->snd_cwnd_cnt % (interval >> 1) == 0) {
 			tp->snd_cwnd = (tp->prior_cwnd + w + 1)/2;
@@ -415,17 +427,37 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 	}
 }
 
+u32 inigo_slow_start(struct tcp_sock *tp, u32 acked)
+{
+	u32 cwnd = tp->snd_cwnd + acked;
+
+	if (cwnd > tp->snd_ssthresh)
+		cwnd = tp->snd_ssthresh + 1;
+	acked -= cwnd - tp->snd_cwnd;
+	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);
+
+	return acked;
+}
+
 void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 {
+	struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
+	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
 
 	if (!tcp_is_cwnd_limited(sk)) {
 		return;
 	}
 
+	/* ssthresh should be increased when no congestion is detected */
+	if (tp->snd_cwnd == tp->snd_ssthresh && alpha == 0)
+			tp->snd_ssthresh *= 2;
+
 	/* In "safe" area, increase. */
 	if (tp->snd_cwnd <= tp->snd_ssthresh) {
-		tcp_slow_start(tp, acked);
+		acked = inigo_slow_start(tp, acked);
+		if (!acked)
+			return;
 	/* In dangerous area, increase slowly. */
 	} else {
 		inigo_cong_avoid_ai(sk, tp->snd_cwnd, acked);
@@ -444,19 +476,20 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 	ca->rtts_total++;
 
 	ca->rtt_min = min((u32) rtt, ca->rtt_min);
-	if (ca->rtt_min < 10) {
-		pr_info("rtt_min too low! rtt=%u, rtt_min=%u", (u32) rtt, ca->rtt_min);
+	if (ca->rtt_min < suspect_rtt) {
+		pr_warn_ratelimited("rtt_min=%u is suspiciously low, setting to rtt=%u\n",
+					ca->rtt_min, (u32) rtt);
 		ca->rtt_min = rtt;
 	}
 
 	/* Mimic DCTCP's ECN marking threshhold of approximately 0.17*BDP */
-	if ((u32) rtt > (ca->rtt_min + (markthresh * ca->rtt_min / 1024U))) {
+	if ((u32) rtt > (ca->rtt_min + (markthresh * ca->rtt_min / INIGO_MAX_MARK))) {
+		u32 rtt_samples_needed = ca->rtts_total * markthresh / INIGO_MAX_MARK;
 		ca->rtts_late++;
 
-		/* Don't want to prematurely exit slowstart. 0.17*rtts_total > 3 */
-		if ((ca->rtts_total * markthresh / 1024U) > 3 &&
-		    tp->snd_cwnd <= tp->snd_ssthresh &&
-		    ca->rtts_late >= (ca->rtts_total * markthresh / 1024U)) {
+		/* Don't prematurely exit slowstart. Need at least 0.17*rtts_total > 3 */
+		if (tp->snd_cwnd < tp->snd_ssthresh &&
+		    ca->rtts_late > max(rtt_samples_needed, min_rtt_samples_needed)) {
 			tp->snd_ssthresh = tp->snd_cwnd;
 			ca->rtts_late = 0;
 		}
