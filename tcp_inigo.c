@@ -67,11 +67,13 @@
 #include <linux/mm.h>
 #include <net/tcp.h>
 #include <linux/inet_diag.h>
+#include <uapi/linux/pkt_sched.h>
 
 #define DCTCP_MAX_ALPHA	1024U
 #define INIGO_MIN_FAIRNESS 4U
 #define INIGO_MAX_FAIRNESS 100U
 #define INIGO_MAX_MARK 1024U
+#define INIGO_MAX_URGENCY 2048U
 
 struct inigo {
 	u32 acked_bytes_ecn;
@@ -86,6 +88,9 @@ struct inigo {
 	u32 rtt_alpha;
 	u32 rtts_late;
 	u32 rtts_total;
+	u32 maxw_at_rtt_min;
+	s32 packets_left;
+	ktime_t deadline;
 };
 
 static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
@@ -111,10 +116,10 @@ static unsigned int markthresh __read_mostly = 180;
 module_param(markthresh, uint, 0644);
 MODULE_PARM_DESC(markthresh, "delay marking threshhold, default=180 out of 1024");
 
-static unsigned int min_rtt_samples_needed __read_mostly = 10;
+static unsigned int min_rtt_samples_needed __read_mostly = 30;
 module_param(min_rtt_samples_needed, uint, 0644);
 MODULE_PARM_DESC(min_rtt_samples_needed, "minimum number of RTT samples needed"
-		 " to exit slowstart, default=10");
+		 " to exit slowstart, default=30");
 
 static unsigned int minor_congestion __read_mostly = 10;
 module_param(minor_congestion, uint, 0644);
@@ -131,6 +136,9 @@ module_param(stabilize, bool, 0644);
 MODULE_PARM_DESC(stabilize, "stabilize congestion response by alternating normal response"
 			 " with averaged response, defaults to false");
 
+static bool deadline_aware  __read_mostly = false;
+module_param(deadline_aware, bool, 0644);
+MODULE_PARM_DESC(deadline_aware, "enable deadline awareness, defaults false");
 
 static void dctcp_reset(const struct tcp_sock *tp, struct inigo *ca)
 {
@@ -152,6 +160,10 @@ static void inigo_init(struct sock *sk)
 	ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
 	ca->rtts_late = 0;
 	ca->rtts_total = 0;
+
+	ca->maxw_at_rtt_min = 2;
+	ca->packets_left = 0;
+	ca->deadline = ktime_set(0, 0);
 
 	if ((tp->ecn_flags & TCP_ECN_OK) ||
 	    (sk->sk_state == TCP_LISTEN ||
@@ -175,11 +187,37 @@ static void inigo_init(struct sock *sk)
 	INET_ECN_dontxmit(sk);
 }
 
+s64 inigo_urgency(struct sock *sk)
+{
+	const struct tcp_sock *tp = tcp_sk(sk);
+	struct inigo *ca = inet_csk_ca(sk);
+	s64 urgency = 0, time_to_complete = 0;
+	s64 dl_us = ktime_to_us(ca->deadline);
+
+	if (dl_us <= 0)
+		return urgency;
+
+	time_to_complete = (ca->rtt_min + (markthresh * ca->rtt_min / INIGO_MAX_MARK)) *
+			   (ca->packets_left - tp->packets_out) * 4 / (3 * tp->snd_cwnd);
+	urgency = DCTCP_MAX_ALPHA * time_to_complete / dl_us;
+	urgency = clamp(urgency, (s64) 0U, (s64) INIGO_MAX_URGENCY);
+
+	pr_info_ratelimited("tcp_inigo: urgency=%u\n", (u32) urgency);
+	return urgency;
+}
+
 static u32 inigo_ssthresh(struct sock *sk)
 {
 	const struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
+	bool backoff = tp->snd_cwnd >= tp->snd_ssthresh &&
+		       alpha > minor_congestion &&
+		       prandom_u32_max(INIGO_MAX_URGENCY) > inigo_urgency(sk);
+
+	pr_debug_ratelimited("tcp_inigo: backoff=%u\n", backoff);
+	if (!backoff)
+		return tp->snd_cwnd;
 
 	if (rtt_fairness &&
 	    tp->snd_cwnd_cnt > INIGO_MIN_FAIRNESS &&
@@ -434,7 +472,7 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 		if (tp->snd_cwnd_cnt % interval == 0 || tp->snd_cwnd_cnt >= w) {
 			inigo_update_rtt_alpha(ca);
 
-			if (ca->rtt_alpha > 0)
+			if (ca->rtt_alpha > minor_congestion)
 				inigo_enter_cwr(sk);
 		}
 		else if (stabilize && tp->snd_cwnd_cnt % (interval >> 1) == 0) {
@@ -474,6 +512,124 @@ void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 	inigo_cong_avoid_ai(sk, tp->snd_cwnd, acked);
 }
 
+void inigo_check_deadline(struct sock *sk, u32 num_acked, u32 rtt)
+{
+	struct inigo *ca = inet_csk_ca(sk);
+	//struct tcp_sock *tp = tcp_sk(sk);
+	u64 p = 0;
+	ktime_t now = ktime_get();
+
+	pr_info_ratelimited("tcp_inigo: sk_priority=%u, now=%llu, deadline=%llu\n",
+			    sk->sk_priority, ktime_to_us(now), ktime_to_us(ca->deadline));
+
+	/* only update deadline info after the previous deadline has passed */
+	if (!ktime_equal(ca->deadline, ktime_set(0, 0)) && ktime_before(ca->deadline, now)) {
+		ca->packets_left -= num_acked;
+		return;
+	}
+
+	switch (sk->sk_priority) {
+	//u32 load, w_load, rtt_load, rtt_thresh, quantum, w_per_p;
+	//u32 load, quantum, w_per_p;
+	case TC_PRIO_BESTEFFORT:
+	/* let's get other cases working first
+		if (ca->rtt_min < INIGO_SUSPECT_RTT) {
+			pr_warn_ratelimited("rtt_min is suspect. not calculating besteffort\n");
+			return;
+		}
+		// doesn't work so well ... way too high
+		//rtt_thresh = ca->rtt_min + (markthresh * ca->rtt_min / INIGO_MAX_MARK);
+		//rtt_load = INIGO_LOAD_SCALE * (rtt - rtt_thresh) / rtt_thresh;
+		load = ca->maxw_at_rtt_min / tp->snd_cwnd;
+		quantum = NSEC_PER_SEC / 2;
+		p = max(1U, load * quantum);
+		w_per_p = p / NSEC_PER_USEC / ca->rtt_min;
+		ca->packets_left = w_per_p * ca->maxw_at_rtt_min;
+		pr_info_ratelimited("load=%u, p=%llu, w_per_p=%u, packets_left=%u, peak bw(Mbps)=%u, share bw(Mbps)=%u\n",
+				     load, p, w_per_p, ca->packets_left,
+				     8*1500*ca->maxw_at_rtt_min / ca->rtt_min,
+				     8*1500*ca->packets_left / (u32) (p / NSEC_PER_USEC));
+		break;
+	*/
+	case TC_PRIO_FILLER:
+		/* deadline unaware filler */
+		return;
+	case TC_PRIO_BULK:
+		/* approximately 15MB/2s */
+		ca->packets_left = 10000;
+		p = NSEC_PER_SEC * 2;
+		break;
+	case 3:
+		/* approximately 75MB/2s */
+		ca->packets_left = 50000;
+		p = NSEC_PER_SEC * 2;
+		break;
+	case TC_PRIO_INTERACTIVE_BULK:
+		/* approximately 15KB/0.1s */
+		ca->packets_left = 10;
+		p = NSEC_PER_SEC / 10;
+		break;
+	case 5:
+		/* approximately 30KB/0.1s */
+		ca->packets_left = 20;
+		p = NSEC_PER_SEC / 10;
+		break;
+	case TC_PRIO_INTERACTIVE:
+		/* approximately 3KB/0.1s */
+		ca->packets_left = 2;
+		p = NSEC_PER_SEC / 10;
+		break;
+	case TC_PRIO_CONTROL:
+		/* approximately 3KB/0.05s */
+		ca->packets_left = 2;
+		p = NSEC_PER_SEC / 20;
+		break;
+	case 8:
+		/* from Brandt RTTS03 paper fig 7*/
+		p = NSEC_PER_SEC * 2 / 10;
+		ca->packets_left = p * ca->maxw_at_rtt_min * 25 / (ca->rtt_min * 100);
+		break;
+	case 9:
+		/* from Brandt RTTS03 paper fig 7*/
+		p = NSEC_PER_SEC * 5 / 10;
+		ca->packets_left = p * ca->maxw_at_rtt_min * 30 / (ca->rtt_min * 100);
+		break;
+	case 10:
+		/* from Brandt RTTS03 paper fig 7*/
+		p = NSEC_PER_SEC;
+		ca->packets_left = p * ca->maxw_at_rtt_min * 35 / (ca->rtt_min * 100);
+		break;
+	case 11:
+		/* from Brandt RTTS03 paper fig 8*/
+		p = NSEC_PER_SEC * 2 / 10;
+		ca->packets_left = p * ca->maxw_at_rtt_min * 20 / (ca->rtt_min * 100);
+		break;
+	case 12:
+		/* from Brandt RTTS03 paper fig 8*/
+		p = NSEC_PER_SEC;
+		ca->packets_left = p * ca->maxw_at_rtt_min * 60 / (ca->rtt_min * 100);
+		break;
+	case 13:
+		/* from Brandt RTTS03 paper fig 8*/
+		p = NSEC_PER_SEC * 5 / 10;
+		ca->packets_left = p * ca->maxw_at_rtt_min * 40 / (ca->rtt_min * 100);
+		break;
+	case 14:
+		p = NSEC_PER_SEC * 5 / 10;
+		ca->packets_left = p * ca->maxw_at_rtt_min * 70 / (ca->rtt_min * 100);
+		break;
+	case TC_PRIO_MAX:
+		p = NSEC_PER_SEC * 5 / 10;
+		ca->packets_left = p * ca->maxw_at_rtt_min * 90 / (ca->rtt_min * 100);
+		break;
+	}
+
+	ca->deadline = ktime_add_us(now, p);
+
+	pr_info_ratelimited("tcp_inigo: sk_priority=%u, p=%llu, packets=%u\n",
+			    sk->sk_priority, p, ca->packets_left);
+}
+
 static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 {
 	struct inigo *ca = inet_csk_ca(sk);
@@ -508,7 +664,12 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 				pr_debug_ratelimited("tcp_inigo: yes, exiting slowstart alpha=%u\n", ca->rtt_alpha);
 			}
 		}
+	} else {
+		ca->maxw_at_rtt_min = max(ca->maxw_at_rtt_min, tp->snd_cwnd);
 	}
+
+	if (deadline_aware && tp->snd_cwnd > tp->snd_ssthresh)
+		inigo_check_deadline(sk, num_acked, (u32) rtt);
 }
 
 /* Put in include/uapi/linux/inet_diag.h */
