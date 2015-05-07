@@ -111,10 +111,15 @@ static unsigned int markthresh __read_mostly = 180;
 module_param(markthresh, uint, 0644);
 MODULE_PARM_DESC(markthresh, "delay marking threshhold, default=180 out of 1024");
 
-static unsigned int min_rtt_samples_needed __read_mostly = 5;
+static unsigned int min_rtt_samples_needed __read_mostly = 10;
 module_param(min_rtt_samples_needed, uint, 0644);
 MODULE_PARM_DESC(min_rtt_samples_needed, "minimum number of RTT samples needed"
-		 " to exit slowstart, default=5");
+		 " to exit slowstart, default=10");
+
+static unsigned int minor_congestion __read_mostly = 10;
+module_param(minor_congestion, uint, 0644);
+MODULE_PARM_DESC(minor_congestion, "anything below X is considered minor,"
+		 " and slowstart will continue, default=10 out of 1024");
 
 static unsigned int rtt_fairness  __read_mostly = 0;
 module_param(rtt_fairness, uint, 0644);
@@ -291,6 +296,9 @@ static void inigo_update_dctcp_alpha(struct sock *sk, u32 flags)
 
 static void inigo_update_rtt_alpha(struct inigo *ca)
 {
+	if (!ca->rtts_total)
+		return;
+
 	ca->rtt_alpha = ca->rtt_alpha -
 			(ca->rtt_alpha >> dctcp_shift_g) +
 			(ca->rtts_late << (10U - dctcp_shift_g)) /
@@ -394,6 +402,18 @@ void inigo_enter_cwr(struct sock *sk)
 	}
 }
 
+u32 inigo_slow_start(struct tcp_sock *tp, u32 acked)
+{
+	u32 cwnd = tp->snd_cwnd + acked;
+
+	if (cwnd > tp->snd_ssthresh)
+		cwnd = tp->snd_ssthresh + 1;
+	acked -= cwnd - tp->snd_cwnd;
+	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);
+
+	return acked;
+}
+
 void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 {
 	struct inigo *ca = inet_csk_ca(sk);
@@ -427,18 +447,6 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 	}
 }
 
-u32 inigo_slow_start(struct tcp_sock *tp, u32 acked)
-{
-	u32 cwnd = tp->snd_cwnd + acked;
-
-	if (cwnd > tp->snd_ssthresh)
-		cwnd = tp->snd_ssthresh + 1;
-	acked -= cwnd - tp->snd_cwnd;
-	tp->snd_cwnd = min(cwnd, tp->snd_cwnd_clamp);
-
-	return acked;
-}
-
 void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 {
 	struct inigo *ca = inet_csk_ca(sk);
@@ -449,19 +457,21 @@ void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 		return;
 	}
 
-	/* ssthresh should be increased when no congestion is detected */
-	if (tp->snd_cwnd == tp->snd_ssthresh && alpha == 0)
-			tp->snd_ssthresh *= 2;
+	/* ssthresh should be increased when minor congestion is detected */
+	if (tp->snd_cwnd == tp->snd_ssthresh && alpha < minor_congestion) {
+		tp->snd_ssthresh = tp->snd_ssthresh << 1;
+		pr_debug_ratelimited("tcp_inigo: continuing slowstart snd_ssthresh=%u, alpha=%u\n",
+				tp->snd_ssthresh, alpha);
+	}
 
 	/* In "safe" area, increase. */
 	if (tp->snd_cwnd <= tp->snd_ssthresh) {
 		acked = inigo_slow_start(tp, acked);
 		if (!acked)
 			return;
-	/* In dangerous area, increase slowly. */
-	} else {
-		inigo_cong_avoid_ai(sk, tp->snd_cwnd, acked);
 	}
+	/* In dangerous area, increase slowly. */
+	inigo_cong_avoid_ai(sk, tp->snd_cwnd, acked);
 }
 
 static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
@@ -477,7 +487,7 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 
 	ca->rtt_min = min((u32) rtt, ca->rtt_min);
 	if (ca->rtt_min < suspect_rtt) {
-		pr_warn_ratelimited("rtt_min=%u is suspiciously low, setting to rtt=%u\n",
+		pr_debug_ratelimited("tcp_inigo: rtt_min=%u is suspiciously low, setting to rtt=%u\n",
 					ca->rtt_min, (u32) rtt);
 		ca->rtt_min = rtt;
 	}
@@ -487,11 +497,16 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 		u32 rtt_samples_needed = ca->rtts_total * markthresh / INIGO_MAX_MARK;
 		ca->rtts_late++;
 
-		/* Don't prematurely exit slowstart. Need at least 0.17*rtts_total > 3 */
+		/* Don't prematurely exit slowstart */
 		if (tp->snd_cwnd < tp->snd_ssthresh &&
 		    ca->rtts_late > max(rtt_samples_needed, min_rtt_samples_needed)) {
-			tp->snd_ssthresh = tp->snd_cwnd;
-			ca->rtts_late = 0;
+			pr_debug_ratelimited("tcp_inigo: exiting slowstart? rtts_late=%u, snd_cwnd=%u\n",
+					ca->rtts_late, tp->snd_cwnd);
+			inigo_update_rtt_alpha(ca);
+			if (ca->rtt_alpha > minor_congestion) {
+				tp->snd_ssthresh = tp->snd_cwnd;
+				pr_debug_ratelimited("tcp_inigo: yes, exiting slowstart alpha=%u\n", ca->rtt_alpha);
+			}
 		}
 	}
 }
