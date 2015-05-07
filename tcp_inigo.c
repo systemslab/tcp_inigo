@@ -111,10 +111,10 @@ static unsigned int markthresh __read_mostly = 180;
 module_param(markthresh, uint, 0644);
 MODULE_PARM_DESC(markthresh, "delay marking threshhold, default=180 out of 1024");
 
-static unsigned int min_rtt_samples_needed __read_mostly = 10;
+static unsigned int min_rtt_samples_needed __read_mostly = 30;
 module_param(min_rtt_samples_needed, uint, 0644);
 MODULE_PARM_DESC(min_rtt_samples_needed, "minimum number of RTT samples needed"
-		 " to exit slowstart, default=10");
+		 " to exit slowstart, default=30");
 
 static unsigned int minor_congestion __read_mostly = 10;
 module_param(minor_congestion, uint, 0644);
@@ -180,6 +180,9 @@ static u32 inigo_ssthresh(struct sock *sk)
 	const struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
+
+	if (alpha < minor_congestion)
+		return tp->snd_cwnd;
 
 	if (rtt_fairness &&
 	    tp->snd_cwnd_cnt > INIGO_MIN_FAIRNESS &&
@@ -434,7 +437,7 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 		if (tp->snd_cwnd_cnt % interval == 0 || tp->snd_cwnd_cnt >= w) {
 			inigo_update_rtt_alpha(ca);
 
-			if (ca->rtt_alpha > 0)
+			if (ca->rtt_alpha > minor_congestion)
 				inigo_enter_cwr(sk);
 		}
 		else if (stabilize && tp->snd_cwnd_cnt % (interval >> 1) == 0) {
