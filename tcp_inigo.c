@@ -73,7 +73,7 @@
 #define INIGO_MIN_FAIRNESS 4U
 #define INIGO_MAX_FAIRNESS 100U
 #define INIGO_MAX_MARK 1024U
-#define INIGO_MAX_URGENCY 2048U
+#define INIGO_MAX_URGENCY 10000U
 
 struct inigo {
 	u32 acked_bytes_ecn;
@@ -187,23 +187,29 @@ static void inigo_init(struct sock *sk)
 	INET_ECN_dontxmit(sk);
 }
 
-s64 inigo_urgency(struct sock *sk)
+static u32 inigo_urgency(struct sock *sk)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct inigo *ca = inet_csk_ca(sk);
-	s64 urgency = 0, time_to_complete = 0;
+	s64 urgency = 0, time_to_complete = 0, time_to_dl = 0;
 	s64 dl_us = ktime_to_us(ca->deadline);
 
 	if (dl_us <= 0)
 		return urgency;
 
-	time_to_complete = (ca->rtt_min + (markthresh * ca->rtt_min / INIGO_MAX_MARK)) *
-			   (ca->packets_left - tp->packets_out) * 4 / (3 * tp->snd_cwnd);
-	urgency = DCTCP_MAX_ALPHA * time_to_complete / dl_us;
-	urgency = clamp(urgency, (s64) 0U, (s64) INIGO_MAX_URGENCY);
+	time_to_dl = ktime_to_us(ktime_sub(ktime_get(), ca->deadline));
+	time_to_complete = (ca->packets_left - tp->packets_out) * 4 / (3 * tp->snd_cwnd);
 
-	pr_info_ratelimited("tcp_inigo: urgency=%u\n", (u32) urgency);
-	return urgency;
+	if (time_to_dl <= 0 && time_to_complete > 0)
+		return INIGO_MAX_URGENCY;
+
+	urgency = INIGO_MAX_URGENCY * time_to_complete / time_to_dl;
+	urgency = clamp(urgency, (s64) 0, (s64) INIGO_MAX_URGENCY);
+
+	pr_info_ratelimited("tcp_inigo: priority=%u, urgency=%u, time_to_complete=%lld, time_to_dl=%lld\n",
+				sk->sk_priority, (u32) urgency, time_to_complete, time_to_dl);
+
+	return (u32) urgency;
 }
 
 static u32 inigo_ssthresh(struct sock *sk)
@@ -211,11 +217,14 @@ static u32 inigo_ssthresh(struct sock *sk)
 	const struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
-	bool backoff = tp->snd_cwnd >= tp->snd_ssthresh &&
-		       alpha > minor_congestion &&
-		       prandom_u32_max(INIGO_MAX_URGENCY) > inigo_urgency(sk);
+	u32 urgency = inigo_urgency(sk);
+	bool backoff = prandom_u32_max(INIGO_MAX_URGENCY) > urgency;
 
-	pr_debug_ratelimited("tcp_inigo: backoff=%u\n", backoff);
+	if (alpha < minor_congestion)
+		return tp->snd_cwnd;
+
+	pr_debug_ratelimited("tcp_inigo: priority=%u, urgency=%u, backoff=%u\n", sk->sk_priority, urgency, backoff);
+
 	if (!backoff)
 		return tp->snd_cwnd;
 
@@ -516,11 +525,8 @@ void inigo_check_deadline(struct sock *sk, u32 num_acked, u32 rtt)
 {
 	struct inigo *ca = inet_csk_ca(sk);
 	//struct tcp_sock *tp = tcp_sk(sk);
-	u64 p = 0;
+	u32 p = 0;
 	ktime_t now = ktime_get();
-
-	pr_info_ratelimited("tcp_inigo: sk_priority=%u, now=%llu, deadline=%llu\n",
-			    sk->sk_priority, ktime_to_us(now), ktime_to_us(ca->deadline));
 
 	/* only update deadline info after the previous deadline has passed */
 	if (!ktime_equal(ca->deadline, ktime_set(0, 0)) && ktime_before(ca->deadline, now)) {
@@ -541,93 +547,105 @@ void inigo_check_deadline(struct sock *sk, u32 num_acked, u32 rtt)
 		//rtt_thresh = ca->rtt_min + (markthresh * ca->rtt_min / INIGO_MAX_MARK);
 		//rtt_load = INIGO_LOAD_SCALE * (rtt - rtt_thresh) / rtt_thresh;
 		load = ca->maxw_at_rtt_min / tp->snd_cwnd;
-		quantum = NSEC_PER_SEC / 2;
+		quantum = USEC_PER_SEC / 2;
 		p = max(1U, load * quantum);
-		w_per_p = p / NSEC_PER_USEC / ca->rtt_min;
+		w_per_p = p / USEC_PER_USEC / ca->rtt_min;
 		ca->packets_left = w_per_p * ca->maxw_at_rtt_min;
 		pr_info_ratelimited("load=%u, p=%llu, w_per_p=%u, packets_left=%u, peak bw(Mbps)=%u, share bw(Mbps)=%u\n",
 				     load, p, w_per_p, ca->packets_left,
 				     8*1500*ca->maxw_at_rtt_min / ca->rtt_min,
-				     8*1500*ca->packets_left / (u32) (p / NSEC_PER_USEC));
+				     8*1500*ca->packets_left / (u32) (p / USEC_PER_USEC));
 		break;
 	*/
 	case TC_PRIO_FILLER:
 		/* deadline unaware filler */
 		return;
 	case TC_PRIO_BULK:
-		/* approximately 15MB/2s */
+		/* approximately 15MB/2s, or 60Mbps enforced every 2s */
 		ca->packets_left = 10000;
-		p = NSEC_PER_SEC * 2;
+		p = USEC_PER_SEC * 2;
 		break;
 	case 3:
-		/* approximately 75MB/2s */
-		ca->packets_left = 50000;
-		p = NSEC_PER_SEC * 2;
+		/* 4.8Mbps */
+		ca->packets_left = 400;
+		p = USEC_PER_SEC;
 		break;
 	case TC_PRIO_INTERACTIVE_BULK:
-		/* approximately 15KB/0.1s */
+		/* approximately 15KB/0.1s, or 1.2Mbps enforced every 0.1s */
 		ca->packets_left = 10;
-		p = NSEC_PER_SEC / 10;
+		p = USEC_PER_SEC / 10;
 		break;
 	case 5:
-		/* approximately 30KB/0.1s */
-		ca->packets_left = 20;
-		p = NSEC_PER_SEC / 10;
+		/* 4.8Mbps */
+		ca->packets_left = 400;
+		p = USEC_PER_SEC;
 		break;
 	case TC_PRIO_INTERACTIVE:
-		/* approximately 3KB/0.1s */
+		/* approximately 3KB/0.1s, or 0.24Mbps enforced every 0.1s  */
 		ca->packets_left = 2;
-		p = NSEC_PER_SEC / 10;
+		p = USEC_PER_SEC / 10;
 		break;
 	case TC_PRIO_CONTROL:
-		/* approximately 3KB/0.05s */
+		/* approximately 3KB/0.05s, or 0.48Mbps enforced every 0.05s  */
 		ca->packets_left = 2;
-		p = NSEC_PER_SEC / 20;
+		p = USEC_PER_SEC / 20;
 		break;
 	case 8:
 		/* from Brandt RTTS03 paper fig 7*/
-		p = NSEC_PER_SEC * 2 / 10;
+		/*
+		p = USEC_PER_SEC * 2 / 10;
 		ca->packets_left = p * ca->maxw_at_rtt_min * 25 / (ca->rtt_min * 100);
+		 */
+		/* 7.488Mbps */
+		ca->packets_left = 624;
+		p = USEC_PER_SEC;
 		break;
 	case 9:
 		/* from Brandt RTTS03 paper fig 7*/
-		p = NSEC_PER_SEC * 5 / 10;
+		/*
+		p = USEC_PER_SEC * 5 / 10;
 		ca->packets_left = p * ca->maxw_at_rtt_min * 30 / (ca->rtt_min * 100);
+		 */
+		/* 2.496Mbps */
+		ca->packets_left = 208;
+		p = USEC_PER_SEC;
 		break;
 	case 10:
 		/* from Brandt RTTS03 paper fig 7*/
-		p = NSEC_PER_SEC;
+		p = USEC_PER_SEC;
 		ca->packets_left = p * ca->maxw_at_rtt_min * 35 / (ca->rtt_min * 100);
 		break;
 	case 11:
 		/* from Brandt RTTS03 paper fig 8*/
-		p = NSEC_PER_SEC * 2 / 10;
+		p = USEC_PER_SEC * 2 / 10;
 		ca->packets_left = p * ca->maxw_at_rtt_min * 20 / (ca->rtt_min * 100);
 		break;
 	case 12:
 		/* from Brandt RTTS03 paper fig 8*/
-		p = NSEC_PER_SEC;
+		p = USEC_PER_SEC;
 		ca->packets_left = p * ca->maxw_at_rtt_min * 60 / (ca->rtt_min * 100);
 		break;
 	case 13:
 		/* from Brandt RTTS03 paper fig 8*/
-		p = NSEC_PER_SEC * 5 / 10;
+		p = USEC_PER_SEC * 5 / 10;
 		ca->packets_left = p * ca->maxw_at_rtt_min * 40 / (ca->rtt_min * 100);
 		break;
 	case 14:
-		p = NSEC_PER_SEC * 5 / 10;
-		ca->packets_left = p * ca->maxw_at_rtt_min * 70 / (ca->rtt_min * 100);
+		p = USEC_PER_SEC * 5 / 10;
+		ca->packets_left = p * ca->maxw_at_rtt_min * 50 / (ca->rtt_min * 100);
 		break;
 	case TC_PRIO_MAX:
-		p = NSEC_PER_SEC * 5 / 10;
-		ca->packets_left = p * ca->maxw_at_rtt_min * 90 / (ca->rtt_min * 100);
+		p = USEC_PER_SEC * 5 / 10;
+		ca->packets_left = p * ca->maxw_at_rtt_min * 80 / (ca->rtt_min * 100);
 		break;
 	}
 
 	ca->deadline = ktime_add_us(now, p);
 
-	pr_info_ratelimited("tcp_inigo: sk_priority=%u, p=%llu, packets=%u\n",
-			    sk->sk_priority, p, ca->packets_left);
+	pr_info_ratelimited("tcp_inigo: sk_priority=%u, p=%u, dl=%lld, packets=%u, Mbps=%u / %u\n",
+				sk->sk_priority, p, ktime_to_us(ca->deadline), ca->packets_left,
+				8*1500*ca->packets_left / p,
+				8*1500*ca->maxw_at_rtt_min / ca->rtt_min);
 }
 
 static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
