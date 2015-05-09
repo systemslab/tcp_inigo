@@ -621,22 +621,28 @@ void inigo_check_deadline(struct sock *sk, u32 num_acked, u32 rtt)
 		ca->packets_left = p * ca->maxw_at_rtt_min * 20 / (ca->rtt_min * 100);
 		break;
 	case 12:
-		/* from Brandt RTTS03 paper fig 8*/
-		p = USEC_PER_SEC;
-		ca->packets_left = p * ca->maxw_at_rtt_min * 60 / (ca->rtt_min * 100);
+		/* 10% with a period 1000x the RTT */
+		p = ca->rtt_min * 1000;
+		//ca->packets_left = p * ca->maxw_at_rtt_min * 10 / (ca->rtt_min * 100);
+		ca->packets_left = ca->maxw_at_rtt_min * 100;
 		break;
 	case 13:
-		/* from Brandt RTTS03 paper fig 8*/
-		p = USEC_PER_SEC * 5 / 10;
-		ca->packets_left = p * ca->maxw_at_rtt_min * 40 / (ca->rtt_min * 100);
+		/* 25% with a period 1000x the RTT */
+		p = ca->rtt_min * 1000;
+		//ca->packets_left = p * ca->maxw_at_rtt_min * 25 / (ca->rtt_min * 100);
+		ca->packets_left = ca->maxw_at_rtt_min * 250;
 		break;
 	case 14:
-		p = USEC_PER_SEC * 5 / 10;
-		ca->packets_left = p * ca->maxw_at_rtt_min * 50 / (ca->rtt_min * 100);
+		/* 50% with a period 1000x the RTT */
+		p = ca->rtt_min * 1000;
+		//ca->packets_left = p * ca->maxw_at_rtt_min * 50 / (ca->rtt_min * 100);
+		ca->packets_left = ca->maxw_at_rtt_min * 500;
 		break;
 	case TC_PRIO_MAX:
-		p = USEC_PER_SEC * 5 / 10;
-		ca->packets_left = p * ca->maxw_at_rtt_min * 80 / (ca->rtt_min * 100);
+		/* 80% with a period 1000x the RTT */
+		p = ca->rtt_min * 1000;
+		//ca->packets_left = p * ca->maxw_at_rtt_min * 80 / (ca->rtt_min * 100);
+		ca->packets_left = ca->maxw_at_rtt_min * 800;
 		break;
 	}
 
