@@ -78,14 +78,14 @@ struct inigo {
 	u32 acked_bytes_total;
 	u32 prior_snd_una;
 	u32 prior_rcv_nxt;
-	u32 dctcp_alpha;
+	u16 dctcp_alpha;
 	u32 next_seq;
-	u32 ce_state;
+	u8 ce_state;
 	u32 delayed_ack_reserved;
 	u32 rtt_min;
-	u32 rtt_alpha;
+	u16 rtt_alpha;
 	u32 rtts_late;
-	u32 rtts_total;
+	u32 rtts_observed;
 };
 
 static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
@@ -151,7 +151,7 @@ static void inigo_init(struct sock *sk)
 	ca->rtt_min = USEC_PER_SEC;
 	ca->rtt_alpha = min(dctcp_alpha_on_init, DCTCP_MAX_ALPHA);
 	ca->rtts_late = 0;
-	ca->rtts_total = 0;
+	ca->rtts_observed = 0;
 
 	if ((tp->ecn_flags & TCP_ECN_OK) ||
 	    (sk->sk_state == TCP_LISTEN ||
@@ -299,26 +299,25 @@ static void inigo_update_dctcp_alpha(struct sock *sk, u32 flags)
 
 static void inigo_update_rtt_alpha(struct inigo *ca)
 {
-	if (!ca->rtts_total)
+	if (!ca->rtts_observed)
 		return;
 
 	ca->rtt_alpha = ca->rtt_alpha -
 			(ca->rtt_alpha >> dctcp_shift_g) +
 			(ca->rtts_late << (10U - dctcp_shift_g)) /
-			ca->rtts_total;
+			ca->rtts_observed;
 
 	if (ca->rtt_alpha > DCTCP_MAX_ALPHA)
 		ca->rtt_alpha = DCTCP_MAX_ALPHA;
 
 	ca->rtts_late = 0;
-	ca->rtts_total = 0;
+	ca->rtts_observed = 0;
 }
 
 static void inigo_state(struct sock *sk, u8 new_state)
 {
 	if (dctcp_clamp_alpha_on_loss && new_state == TCP_CA_Loss) {
 		struct inigo *ca = inet_csk_ca(sk);
-
 		/* If this extension is enabled, we clamp dctcp_alpha to
 		 * max on packet loss; the motivation is that dctcp_alpha
 		 * is an indicator to the extend of congestion and packet
@@ -486,7 +485,7 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 	if (rtt <= 0)
 		return;
 
-	ca->rtts_total++;
+	ca->rtts_observed++;
 
 	ca->rtt_min = min((u32) rtt, ca->rtt_min);
 	if (ca->rtt_min < suspect_rtt) {
@@ -497,7 +496,7 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 
 	/* Mimic DCTCP's ECN marking threshhold of approximately 0.17*BDP */
 	if ((u32) rtt > (ca->rtt_min + (markthresh * ca->rtt_min / INIGO_MAX_MARK))) {
-		u32 rtt_samples_needed = ca->rtts_total * markthresh / INIGO_MAX_MARK;
+		u32 rtt_samples_needed = ca->rtts_observed * markthresh / INIGO_MAX_MARK;
 		ca->rtts_late++;
 
 		/* Don't prematurely exit slowstart */
@@ -521,14 +520,14 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 
 struct tcp_inigo_info {
 	__u16   dctcp_enabled;
-	__u16   dctcp_ce_state;
-	__u32   dctcp_alpha;
+	__u8   dctcp_ce_state;
+	__u16   dctcp_alpha;
 	__u32   dctcp_ab_ecn;
 	__u32   dctcp_ab_tot;
 	__u32   rtt_min;
-	__u32   rtt_alpha;
+	__u16   rtt_alpha;
 	__u32   rtts_late;
-	__u32   rtts_total;
+	__u32   rtts_observed;
 };
 
 static void inigo_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
@@ -546,24 +545,24 @@ static void inigo_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
 		memset(&info, 0, sizeof(info));
 		if ((tp->ecn_flags & TCP_ECN_OK)) {
 			info.dctcp_enabled = 1;
-			info.dctcp_ce_state = (u16) ca->ce_state;
+			info.dctcp_ce_state = (u8) ca->ce_state;
 			info.dctcp_alpha = ca->dctcp_alpha;
 			info.dctcp_ab_ecn = ca->acked_bytes_ecn;
 			info.dctcp_ab_tot = ca->acked_bytes_total;
 			info.rtt_min = ca->rtt_min;
 			info.rtt_alpha = ca->rtt_alpha;
 			info.rtts_late = ca->rtts_late;
-			info.rtts_total = ca->rtts_total;
+			info.rtts_observed = ca->rtts_observed;
 		} else {
 			info.dctcp_enabled = 0;
-			info.dctcp_ce_state = (u16) 0;
+			info.dctcp_ce_state = (u8) 0;
 			info.dctcp_alpha = ca->dctcp_alpha;
 			info.dctcp_ab_ecn = ca->acked_bytes_ecn;
 			info.dctcp_ab_tot = ca->acked_bytes_total;
 			info.rtt_min = ca->rtt_min;
 			info.rtt_alpha = ca->rtt_alpha;
 			info.rtts_late = ca->rtts_late;
-			info.rtts_total = ca->rtts_total;
+			info.rtts_observed = ca->rtts_observed;
 		}
 
 		nla_put(skb, INET_DIAG_INIGOINFO, sizeof(info), &info);
