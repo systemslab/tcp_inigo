@@ -116,10 +116,15 @@ module_param(min_rtt_samples_needed, uint, 0644);
 MODULE_PARM_DESC(min_rtt_samples_needed, "minimum number of RTT samples needed"
 		 " to exit slowstart, default=30");
 
-static unsigned int minor_congestion __read_mostly = 10;
+static unsigned int nominal_congestion __read_mostly = 50;
+module_param(nominal_congestion, uint, 0644);
+MODULE_PARM_DESC(nominal_congestion, "any alpha below nominal results in"
+		 " slowstart continuing, default=50 out of 1024");
+
+static unsigned int minor_congestion __read_mostly = 100;
 module_param(minor_congestion, uint, 0644);
-MODULE_PARM_DESC(minor_congestion, "anything below X is considered minor,"
-		 " and slowstart will continue, default=10 out of 1024");
+MODULE_PARM_DESC(minor_congestion, "any alpha above nominal and below minor results in"
+		 " congestion avoidance continuing, default=100 out of 1024");
 
 static unsigned int rtt_fairness  __read_mostly = 0;
 module_param(rtt_fairness, uint, 0644);
@@ -181,6 +186,8 @@ static u32 inigo_ssthresh(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
 
+	if (alpha < nominal_congestion)
+		return tp->snd_cwnd << 1U;
 	if (alpha < minor_congestion)
 		return tp->snd_cwnd;
 
