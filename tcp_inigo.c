@@ -80,12 +80,12 @@ struct inigo {
 	u32 prior_rcv_nxt;
 	u16 dctcp_alpha;
 	u32 next_seq;
-	u8 ce_state;
 	u32 delayed_ack_reserved;
 	u32 rtt_min;
 	u16 rtt_alpha;
 	u32 rtts_late;
 	u32 rtts_observed;
+	u8 ce_state;
 };
 
 static unsigned int dctcp_shift_g __read_mostly = 4; /* g = 1/2^4 */
@@ -104,27 +104,33 @@ MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 
 static unsigned int suspect_rtt  __read_mostly = 10;
 module_param(suspect_rtt, uint, 0644);
-MODULE_PARM_DESC(suspect_rtt, "throw out RTTs smaller than X microseconds,"
-		 " defaults to 10");
+MODULE_PARM_DESC(suspect_rtt, "throw out RTTs smaller than suspect_rtt microseconds,"
+		 " defaults to 10 out of 1024");
 
-static unsigned int markthresh __read_mostly = 180;
+static unsigned int markthresh __read_mostly = 174;
 module_param(markthresh, uint, 0644);
-MODULE_PARM_DESC(markthresh, "delay marking threshhold, default=180 out of 1024");
+MODULE_PARM_DESC(markthresh, "rtts >  rtt_min + rtt_min * markthresh / 1024 are considered marks of congestion,"
+		" defaults to 174 out of 1024");
 
-static unsigned int min_rtt_samples_needed __read_mostly = 30;
-module_param(min_rtt_samples_needed, uint, 0644);
-MODULE_PARM_DESC(min_rtt_samples_needed, "minimum number of RTT samples needed"
+static unsigned int slowstart_rtt_observations_needed __read_mostly = 30;
+module_param(slowstart_rtt_observations_needed, uint, 0644);
+MODULE_PARM_DESC(slowstart_rtt_observations_needed, "minimum number of RTT observations needed"
 		 " to exit slowstart, default=30");
 
-static unsigned int minor_congestion __read_mostly = 10;
+static unsigned int minor_congestion __read_mostly = 11;
 module_param(minor_congestion, uint, 0644);
-MODULE_PARM_DESC(minor_congestion, "anything below X is considered minor,"
-		 " and slowstart will continue, default=10 out of 1024");
+MODULE_PARM_DESC(minor_congestion, "anything below minor_congestion is considered minor,"
+		 " and slowstart will continue, defaults to 11 out of 1024");
+
+static unsigned int major_congestion __read_mostly = 990;
+module_param(major_congestion, uint, 0644);
+MODULE_PARM_DESC(major_congestion, "activate min RTT dilation when rtt_alpha >= major_congestion,"
+		 " defaults to 900 out of 1024");
 
 static unsigned int rtt_fairness  __read_mostly = 0;
 module_param(rtt_fairness, uint, 0644);
-MODULE_PARM_DESC(rtt_fairness, "If non-zero, react to congestion every x acks,"
-		 " 3 < x < 101. Defaults to 0, indicating once per window");
+MODULE_PARM_DESC(rtt_fairness, "if non-zero, react to congestion every x acks,"
+		 " 3 < x < 101, defaults to 0, indicating once per window");
 
 static bool stabilize  __read_mostly = false;
 module_param(stabilize, bool, 0644);
@@ -495,20 +501,15 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 	}
 
 	/* Mimic DCTCP's ECN marking threshhold of approximately 0.17*BDP */
-	if ((u32) rtt > (ca->rtt_min + (markthresh * ca->rtt_min / INIGO_MAX_MARK))) {
-		u32 rtt_samples_needed = ca->rtts_observed * markthresh / INIGO_MAX_MARK;
+	if ((u32) rtt > (ca->rtt_min + (ca->rtt_min * markthresh / INIGO_MAX_MARK / 2))) {
 		ca->rtts_late++;
 
-		/* Don't prematurely exit slowstart */
 		if (tp->snd_cwnd < tp->snd_ssthresh &&
-		    ca->rtts_late > max(rtt_samples_needed, min_rtt_samples_needed)) {
-			pr_debug_ratelimited("tcp_inigo: exiting slowstart? rtts_late=%u, snd_cwnd=%u\n",
-					ca->rtts_late, tp->snd_cwnd);
+		    ca->rtts_observed > slowstart_rtt_observations_needed) {
 			inigo_update_rtt_alpha(ca);
-			if (ca->rtt_alpha > minor_congestion) {
+
+			if (ca->rtt_alpha > minor_congestion)
 				tp->snd_ssthresh = tp->snd_cwnd;
-				pr_debug_ratelimited("tcp_inigo: yes, exiting slowstart alpha=%u\n", ca->rtt_alpha);
-			}
 		}
 	}
 }
