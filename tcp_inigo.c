@@ -410,6 +410,9 @@ void inigo_enter_cwr(struct sock *sk)
 	}
 }
 
+/* This is the same as newer tcp_slow_start(). It is only here for while inigo
+ * is being built out of tree against older kernels that don't do it this way.
+ */
 u32 inigo_slow_start(struct tcp_sock *tp, u32 acked)
 {
 	u32 cwnd = tp->snd_cwnd + acked;
@@ -442,8 +445,14 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 		if (tp->snd_cwnd_cnt % interval == 0 || tp->snd_cwnd_cnt >= w) {
 			inigo_update_rtt_alpha(ca);
 
-			if (ca->rtt_alpha > minor_congestion)
+			if (ca->rtt_alpha > minor_congestion) {
 				inigo_enter_cwr(sk);
+			} else if (ca->rtt_alpha == 0 &&
+				   tp->snd_cwnd == tp->snd_ssthresh) {
+				tp->snd_ssthresh = tp->snd_ssthresh << 1;
+				pr_info_ratelimited("tcp_inigo: continuing slowstart snd_ssthresh=%u, alpha=%u\n",
+					tp->snd_ssthresh, ca->rtt_alpha);
+			}
 		}
 		else if (stabilize && tp->snd_cwnd_cnt % (interval >> 1) == 0) {
 			tp->snd_cwnd = (tp->prior_cwnd + w + 1)/2;
@@ -459,21 +468,22 @@ void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 {
 	struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
 
 	if (!tcp_is_cwnd_limited(sk)) {
 		return;
 	}
 
-	/* ssthresh should be increased when minor congestion is detected */
-	if (tp->snd_cwnd == tp->snd_ssthresh && alpha < minor_congestion) {
-		tp->snd_ssthresh = tp->snd_ssthresh << 1;
-		pr_debug_ratelimited("tcp_inigo: continuing slowstart snd_ssthresh=%u, alpha=%u\n",
-				tp->snd_ssthresh, alpha);
-	}
-
-	/* In "safe" area, increase. */
 	if (tp->snd_cwnd <= tp->snd_ssthresh) {
+		if (ca->rtts_observed > slowstart_rtt_observations_needed) {
+			inigo_update_rtt_alpha(ca);
+
+			if (ca->rtt_alpha > minor_congestion) {
+				inigo_enter_cwr(sk);
+				return;
+			}
+		}
+
+		/* In "safe" area, increase. */
 		acked = inigo_slow_start(tp, acked);
 		if (!acked)
 			return;
@@ -501,17 +511,8 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 	}
 
 	/* Mimic DCTCP's ECN marking threshhold of approximately 0.17*BDP */
-	if ((u32) rtt > (ca->rtt_min + (ca->rtt_min * markthresh / INIGO_MAX_MARK / 2))) {
+	if ((u32) rtt > (ca->rtt_min + (ca->rtt_min * markthresh / INIGO_MAX_MARK)))
 		ca->rtts_late++;
-
-		if (tp->snd_cwnd < tp->snd_ssthresh &&
-		    ca->rtts_observed > slowstart_rtt_observations_needed) {
-			inigo_update_rtt_alpha(ca);
-
-			if (ca->rtt_alpha > minor_congestion)
-				tp->snd_ssthresh = tp->snd_cwnd;
-		}
-	}
 }
 
 /* Put in include/uapi/linux/inet_diag.h */
