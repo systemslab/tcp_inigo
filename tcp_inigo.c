@@ -193,6 +193,9 @@ static u32 inigo_ssthresh(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
 
+	if (!ca->rtts_observed)
+		return tp->snd_ssthresh;
+
 	return max(tp->snd_cwnd - ((tp->snd_cwnd * alpha) >> 11U) / ca->rtts_observed, 2U);
 }
 
