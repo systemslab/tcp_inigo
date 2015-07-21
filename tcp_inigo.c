@@ -102,21 +102,21 @@ module_param(dctcp_clamp_alpha_on_loss, uint, 0644);
 MODULE_PARM_DESC(dctcp_clamp_alpha_on_loss,
 		 "parameter for clamping alpha on loss");
 
-static unsigned int suspect_rtt  __read_mostly = 5;
+static unsigned int suspect_rtt  __read_mostly = 15;
 module_param(suspect_rtt, uint, 0644);
 MODULE_PARM_DESC(suspect_rtt, "throw out RTTs smaller than suspect_rtt microseconds,"
-		 " defaults to 5");
+		 " defaults to 15");
 
-static unsigned int ssmarkthresh __read_mostly = 150;
+static unsigned int ssmarkthresh __read_mostly = 174;
 module_param(ssmarkthresh, uint, 0644);
 MODULE_PARM_DESC(ssmarkthresh, "rtts >  rtt_min + rtt_min * ssmarkthresh / 1024"
 		" are considered marks of congestion during slowstart,"
-		" defaults to 150 out of 1024");
+		" defaults to 174 out of 1024");
 
-static unsigned int markthresh __read_mostly = 174;
+static unsigned int markthresh __read_mostly = 360;
 module_param(markthresh, uint, 0644);
 MODULE_PARM_DESC(markthresh, "rtts >  rtt_min + rtt_min * markthresh / 1024"
-		" are considered marks of congestion, defaults to 174 out of 1024");
+		" are considered marks of congestion, defaults to 360 out of 1024");
 
 static unsigned int slowstart_rtt_observations_needed __read_mostly = 10;
 module_param(slowstart_rtt_observations_needed, uint, 0644);
@@ -125,8 +125,8 @@ MODULE_PARM_DESC(slowstart_rtt_observations_needed, "minimum number of RTT obser
 
 static unsigned int minor_congestion __read_mostly = 200;
 module_param(minor_congestion, uint, 0644);
-MODULE_PARM_DESC(minor_congestion, "anything below minor_congestion is considered minor,"
-		 " and slowstart will continue, defaults to 200 out of 1024");
+MODULE_PARM_DESC(minor_congestion, "for anything below minor_congestion slowstart will continue,"
+		 " defaults to 200 out of 1024");
 
 static unsigned int major_congestion __read_mostly = 990;
 module_param(major_congestion, uint, 0644);
