@@ -514,62 +514,6 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 		ca->rtts_late++;
 }
 
-/* Put in include/uapi/linux/inet_diag.h */
-/* INET_DIAG_INIGOINFO */
-
-#define INET_DIAG_INIGOINFO 10
-
-struct tcp_inigo_info {
-	__u16   dctcp_enabled;
-	__u8   dctcp_ce_state;
-	__u16   dctcp_alpha;
-	__u32   dctcp_ab_ecn;
-	__u32   dctcp_ab_tot;
-	__u32   rtt_min;
-	__u16   rtt_alpha;
-	__u32   rtts_late;
-	__u32   rtts_observed;
-};
-
-static void inigo_get_info(struct sock *sk, u32 ext, struct sk_buff *skb)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-	const struct inigo *ca = inet_csk_ca(sk);
-
-	/* Fill it also in case of VEGASINFO due to req struct limits.
-	 * We can still correctly retrieve it later.
-	 */
-	if (ext & (1 << (INET_DIAG_INIGOINFO - 1)) ||
-	    ext & (1 << (INET_DIAG_VEGASINFO - 1))) {
-		struct tcp_inigo_info info;
-
-		memset(&info, 0, sizeof(info));
-		if ((tp->ecn_flags & TCP_ECN_OK)) {
-			info.dctcp_enabled = 1;
-			info.dctcp_ce_state = (u8) ca->ce_state;
-			info.dctcp_alpha = ca->dctcp_alpha;
-			info.dctcp_ab_ecn = ca->acked_bytes_ecn;
-			info.dctcp_ab_tot = ca->acked_bytes_total;
-			info.rtt_min = ca->rtt_min;
-			info.rtt_alpha = ca->rtt_alpha;
-			info.rtts_late = ca->rtts_late;
-			info.rtts_observed = ca->rtts_observed;
-		} else {
-			info.dctcp_enabled = 0;
-			info.dctcp_ce_state = (u8) 0;
-			info.dctcp_alpha = ca->dctcp_alpha;
-			info.dctcp_ab_ecn = ca->acked_bytes_ecn;
-			info.dctcp_ab_tot = ca->acked_bytes_total;
-			info.rtt_min = ca->rtt_min;
-			info.rtt_alpha = ca->rtt_alpha;
-			info.rtts_late = ca->rtts_late;
-			info.rtts_observed = ca->rtts_observed;
-		}
-
-		nla_put(skb, INET_DIAG_INIGOINFO, sizeof(info), &info);
-	}
-}
-
 static struct tcp_congestion_ops inigo __read_mostly = {
 	.init		= inigo_init,
 	.in_ack_event   = inigo_update_dctcp_alpha,
@@ -578,7 +522,6 @@ static struct tcp_congestion_ops inigo __read_mostly = {
 	.cong_avoid	= inigo_cong_avoid,
 	.pkts_acked 	= inigo_pkts_acked,
 	.set_state	= inigo_state,
-	.get_info	= inigo_get_info,
 	.owner		= THIS_MODULE,
 	.name		= "inigo",
 };
