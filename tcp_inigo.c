@@ -99,17 +99,17 @@ module_param(suspect_rtt, uint, 0644);
 MODULE_PARM_DESC(suspect_rtt, "throw out RTTs smaller than suspect_rtt microseconds,"
 		 " defaults to 15");
 
-static unsigned int markthresh __read_mostly = 360;
+static unsigned int markthresh __read_mostly = 174;
 module_param(markthresh, uint, 0644);
 MODULE_PARM_DESC(markthresh, "rtts >  rtt_min + rtt_min * markthresh / 1024"
-		" are considered marks of congestion, defaults to 360 out of 1024");
+		" are considered marks of congestion, defaults to 174 out of 1024");
 
-static unsigned int slowstart_rtt_observations_needed __read_mostly = 8;
+static unsigned int slowstart_rtt_observations_needed __read_mostly = 10;
 module_param(slowstart_rtt_observations_needed, uint, 0644);
 MODULE_PARM_DESC(slowstart_rtt_observations_needed, "minimum number of RTT observations needed"
 		 " to exit slowstart, defaults to 10");
 
-static unsigned int rtt_fairness  __read_mostly = 30;
+static unsigned int rtt_fairness  __read_mostly = 20;
 module_param(rtt_fairness, uint, 0644);
 MODULE_PARM_DESC(rtt_fairness, "if non-zero, react to congestion every x acks during cong avoid,"
 		 " 2 < x < 101, defaults to 0, where 0 indicates once per window");
@@ -400,9 +400,6 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 interval = tp->snd_cwnd;
 
-	if (rtt_fairness)
-		interval = min(interval, rtt_fairness);
-
 	if (tp->snd_cwnd_cnt >= w) {
 		if (tp->snd_cwnd < tp->snd_cwnd_clamp)
 			tp->snd_cwnd++;
@@ -410,6 +407,9 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 		if (!ca->rtt_alpha)
 			tp->snd_cwnd_cnt = 0;
 	}
+
+	if (rtt_fairness)
+		interval = min(interval, rtt_fairness);
 
 	if (tp->snd_cwnd_cnt >= interval) {
 		if (tp->snd_cwnd_cnt % interval == 0 || tp->snd_cwnd_cnt >= w) {
