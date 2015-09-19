@@ -9,14 +9,6 @@
  * The motivation behind the RTT fairness functionality comes from
  * the 2nd DCTCP paper listed below.
  *
- * The motivation behind the stabilize functionality comes from:
- *
- * Alizadeh, Mohammad, et al.
- * "Stability analysis of QCN: the averaging principle."
- * Proceedings of the ACM SIGMETRICS joint international conference
- * on Measurement and modeling of computer systems. ACM, 2011.
- * http://sedcl.stanford.edu.oca.ucsc.edu/files/qcn-analysis.pdf
- *
  * Authors:
  *
  *	Andrew Shewmaker <agshew@gmail.com>
@@ -69,7 +61,7 @@
 #include <linux/inet_diag.h>
 
 #define DCTCP_MAX_ALPHA	1024U
-#define INIGO_MIN_FAIRNESS 4U
+#define INIGO_MIN_FAIRNESS 2U
 #define INIGO_MAX_FAIRNESS 100U
 #define INIGO_MAX_MARK 1024U
 
@@ -107,41 +99,20 @@ module_param(suspect_rtt, uint, 0644);
 MODULE_PARM_DESC(suspect_rtt, "throw out RTTs smaller than suspect_rtt microseconds,"
 		 " defaults to 15");
 
-static unsigned int ssmarkthresh __read_mostly = 174;
-module_param(ssmarkthresh, uint, 0644);
-MODULE_PARM_DESC(ssmarkthresh, "rtts >  rtt_min + rtt_min * ssmarkthresh / 1024"
-		" are considered marks of congestion during slowstart,"
-		" defaults to 174 out of 1024");
-
 static unsigned int markthresh __read_mostly = 360;
 module_param(markthresh, uint, 0644);
 MODULE_PARM_DESC(markthresh, "rtts >  rtt_min + rtt_min * markthresh / 1024"
 		" are considered marks of congestion, defaults to 360 out of 1024");
 
-static unsigned int slowstart_rtt_observations_needed __read_mostly = 10;
+static unsigned int slowstart_rtt_observations_needed __read_mostly = 8;
 module_param(slowstart_rtt_observations_needed, uint, 0644);
 MODULE_PARM_DESC(slowstart_rtt_observations_needed, "minimum number of RTT observations needed"
 		 " to exit slowstart, defaults to 10");
 
-static unsigned int minor_congestion __read_mostly = 200;
-module_param(minor_congestion, uint, 0644);
-MODULE_PARM_DESC(minor_congestion, "for anything below minor_congestion slowstart will continue,"
-		 " defaults to 200 out of 1024");
-
-static unsigned int major_congestion __read_mostly = 990;
-module_param(major_congestion, uint, 0644);
-MODULE_PARM_DESC(major_congestion, "activate min RTT dilation when rtt_alpha >= major_congestion,"
-		 " defaults to 900 out of 1024");
-
-static unsigned int rtt_fairness  __read_mostly = 0;
+static unsigned int rtt_fairness  __read_mostly = 30;
 module_param(rtt_fairness, uint, 0644);
 MODULE_PARM_DESC(rtt_fairness, "if non-zero, react to congestion every x acks during cong avoid,"
-		 " 3 < x < 101, defaults to 0, where 0 indicates once per window");
-
-static bool stabilize  __read_mostly = false;
-module_param(stabilize, bool, 0644);
-MODULE_PARM_DESC(stabilize, "stabilize congestion response by alternating normal response"
-			 " with averaged response, defaults to false");
+		 " 2 < x < 101, defaults to 0, where 0 indicates once per window");
 
 
 static void dctcp_reset(const struct tcp_sock *tp, struct inigo *ca)
@@ -193,10 +164,7 @@ static u32 inigo_ssthresh(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
 
-	if (!ca->rtts_observed)
-		return tp->snd_ssthresh;
-
-	return max(tp->snd_cwnd - ((tp->snd_cwnd * alpha) >> 11U) / ca->rtts_observed, 2U);
+	return max(tp->snd_cwnd - ((ca->rtts_observed * alpha) >> 11U), 2U);
 }
 
 /* Minimal DCTP CE state machine:
@@ -389,7 +357,7 @@ static void inigo_init_cwnd_reduction(struct sock *sk)
 
 	tp->high_seq = tp->snd_nxt;
 	tp->tlp_high_seq = 0;
-	tp->snd_cwnd_cnt = 0;
+	// tp->snd_cwnd_cnt = 0; commented out because of rtt-fairness support
 	tp->prior_cwnd = tp->snd_cwnd;
 	tp->prr_delivered = 0;
 	tp->prr_out = 0;
@@ -430,28 +398,25 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 {
 	struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	u32 interval;
+	u32 interval = tp->snd_cwnd;
+
+	if (rtt_fairness)
+		interval = min(interval, rtt_fairness);
 
 	if (tp->snd_cwnd_cnt >= w) {
 		if (tp->snd_cwnd < tp->snd_cwnd_clamp)
 			tp->snd_cwnd++;
+
+		if (!ca->rtt_alpha)
+			tp->snd_cwnd_cnt = 0;
 	}
 
-	if (tp->snd_cwnd_cnt > INIGO_MIN_FAIRNESS) {
-		if (rtt_fairness == 0)
-			interval = w;
-		else
-			interval = rtt_fairness;
-
+	if (tp->snd_cwnd_cnt >= interval) {
 		if (tp->snd_cwnd_cnt % interval == 0 || tp->snd_cwnd_cnt >= w) {
 			inigo_update_rtt_alpha(ca);
 
-			if (ca->rtt_alpha > minor_congestion)
+			if (ca->rtt_alpha)
 				inigo_enter_cwr(sk);
-
-		} else if (stabilize && tp->snd_cwnd_cnt % (interval >> 1) == 0) {
-			tp->snd_cwnd = (tp->prior_cwnd + w + 1)/2;
-			pr_info_ratelimited("tcp_inigo: stabilize cwnd_cnt=%u, cwnd=%u, ssthresh=%u, alpha=%u\n", tp->snd_cwnd_cnt, tp->snd_cwnd, tp->snd_ssthresh, ca->rtt_alpha);
 		}
 	}
 
@@ -473,7 +438,7 @@ void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 		if (ca->rtts_observed >= slowstart_rtt_observations_needed) {
 			inigo_update_rtt_alpha(ca);
 
-			if (ca->rtt_alpha > minor_congestion) {
+			if (ca->rtt_alpha) {
 				inigo_enter_cwr(sk);
 				return;
 			}
@@ -491,7 +456,6 @@ void inigo_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 {
 	struct inigo *ca = inet_csk_ca(sk);
-	struct tcp_sock *tp = tcp_sk(sk);
 
 	/* Some calls are for duplicates without timetamps */
 	if (rtt <= 0)
@@ -507,10 +471,7 @@ static void inigo_pkts_acked(struct sock *sk, u32 num_acked, s32 rtt)
 	}
 
 	/* Mimic DCTCP's ECN marking threshhold of approximately 0.17*BDP */
-	if (tp->snd_cwnd < tp->snd_ssthresh &&
-	    (u32) rtt > (ca->rtt_min + (ca->rtt_min * ssmarkthresh / INIGO_MAX_MARK)))
-		ca->rtts_late++;
-	else if ((u32) rtt > (ca->rtt_min + (ca->rtt_min * markthresh / INIGO_MAX_MARK)))
+	if ((u32) rtt > (ca->rtt_min + (ca->rtt_min * markthresh / INIGO_MAX_MARK)))
 		ca->rtts_late++;
 }
 
