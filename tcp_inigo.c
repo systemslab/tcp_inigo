@@ -109,10 +109,10 @@ module_param(slowstart_rtt_observations_needed, uint, 0644);
 MODULE_PARM_DESC(slowstart_rtt_observations_needed, "minimum number of RTT observations needed"
 		 " to exit slowstart, defaults to 10");
 
-static unsigned int rtt_fairness  __read_mostly = 20;
+static unsigned int rtt_fairness  __read_mostly = 10;
 module_param(rtt_fairness, uint, 0644);
 MODULE_PARM_DESC(rtt_fairness, "if non-zero, react to congestion every x acks during cong avoid,"
-		 " 0 indicates once per window, otherwise 3 < x < 512, defaults to 20");
+		 " 0 indicates once per window, otherwise 3 < x < 512, defaults to 10");
 
 
 static void dctcp_reset(const struct tcp_sock *tp, struct inigo *ca)
