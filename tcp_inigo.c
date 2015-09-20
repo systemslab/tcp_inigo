@@ -61,8 +61,8 @@
 #include <linux/inet_diag.h>
 
 #define DCTCP_MAX_ALPHA	1024U
-#define INIGO_MIN_FAIRNESS 2U
-#define INIGO_MAX_FAIRNESS 100U
+#define INIGO_MIN_FAIRNESS 3U   // alpha sensitivity of 684 / 1024
+#define INIGO_MAX_FAIRNESS 512U // alpha sensitivity of 4 / 1024
 #define INIGO_MAX_MARK 1024U
 
 struct inigo {
@@ -112,7 +112,7 @@ MODULE_PARM_DESC(slowstart_rtt_observations_needed, "minimum number of RTT obser
 static unsigned int rtt_fairness  __read_mostly = 20;
 module_param(rtt_fairness, uint, 0644);
 MODULE_PARM_DESC(rtt_fairness, "if non-zero, react to congestion every x acks during cong avoid,"
-		 " 2 < x < 101, defaults to 0, where 0 indicates once per window");
+		 " 0 indicates once per window, otherwise 3 < x < 512, defaults to 20");
 
 
 static void dctcp_reset(const struct tcp_sock *tp, struct inigo *ca)
@@ -163,8 +163,14 @@ static u32 inigo_ssthresh(struct sock *sk)
 	const struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
+	u32 interval = tp->snd_cwnd;
 
-	return max(tp->snd_cwnd - ((ca->rtts_observed * alpha) >> 11U), 2U);
+	if (rtt_fairness && (tp->snd_cwnd - tp->snd_cwnd_cnt) < rtt_fairness)
+		interval = tp->snd_cwnd % rtt_fairness;
+	else
+		interval = rtt_fairness;
+
+	return max(tp->snd_cwnd - ((interval * alpha) >> 11U), 2U);
 }
 
 /* Minimal DCTP CE state machine:
@@ -404,8 +410,7 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 		if (tp->snd_cwnd < tp->snd_cwnd_clamp)
 			tp->snd_cwnd++;
 
-		if (!ca->rtt_alpha)
-			tp->snd_cwnd_cnt = 0;
+		tp->snd_cwnd_cnt = 0;
 	}
 
 	if (rtt_fairness)
