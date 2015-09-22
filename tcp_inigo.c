@@ -162,13 +162,21 @@ static u32 inigo_ssthresh(struct sock *sk)
 {
 	const struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
-	u32 alpha = max(ca->dctcp_alpha, ca->rtt_alpha);
+	u16 alpha = ca->dctcp_alpha;
 	u32 interval = tp->snd_cwnd;
 
-	if (rtt_fairness && (tp->snd_cwnd - tp->snd_cwnd_cnt) < rtt_fairness)
-		interval = tp->snd_cwnd % rtt_fairness;
-	else
-		interval = rtt_fairness;
+	if (rtt_fairness) {
+		alpha = ca->rtt_alpha;
+		if ((tp->snd_cwnd - tp->snd_cwnd_cnt) < rtt_fairness)
+			interval = tp->snd_cwnd % rtt_fairness;
+		else
+			interval = rtt_fairness;
+	} else {
+		/* Only use max alpha when NOT making subwindow adj.
+		 * At least until I get subwindows working with DCTCP.
+		 */
+		alpha = max(alpha, ca->rtt_alpha);
+	}
 
 	return max(tp->snd_cwnd - ((interval * alpha) >> 11U), 2U);
 }
@@ -280,16 +288,27 @@ static void inigo_update_dctcp_alpha(struct sock *sk, u32 flags)
 
 static void inigo_update_rtt_alpha(struct inigo *ca)
 {
-	if (!ca->rtts_observed)
-		return;
+	u32 alpha = ca->rtt_alpha;
+	u32 marks = ca->rtts_late;
+	u32 total = ca->rtts_observed;
 
-	ca->rtt_alpha = ca->rtt_alpha -
-			(ca->rtt_alpha >> dctcp_shift_g) +
-			(ca->rtts_late << (10U - dctcp_shift_g)) /
-			ca->rtts_observed;
+	/* alpha = (1 - g) * alpha + g * F */
+	if (alpha > (1 << dctcp_shift_g))
+		alpha -= alpha >> dctcp_shift_g;
+	else
+		alpha = 0; // otherwise, alpha can never reach zero
 
-	if (ca->rtt_alpha > DCTCP_MAX_ALPHA)
-		ca->rtt_alpha = DCTCP_MAX_ALPHA;
+	if (marks) {
+		/* If shift_g == 1, a 32bit value would overflow
+		 * after 8 M.
+		 */
+		marks <<= (10 - dctcp_shift_g);
+		do_div(marks, max(1U, total));
+
+		alpha = min(alpha + (u32)marks, DCTCP_MAX_ALPHA);
+        }
+
+	ca->rtt_alpha = alpha;
 }
 
 static void inigo_state(struct sock *sk, u8 new_state)
@@ -407,8 +426,11 @@ void inigo_cong_avoid_ai(struct sock *sk, u32 w, u32 acked)
 	u32 interval = tp->snd_cwnd;
 
 	if (tp->snd_cwnd_cnt >= w) {
-		if (tp->snd_cwnd < tp->snd_cwnd_clamp)
+		if (tp->snd_cwnd < tp->snd_cwnd_clamp) {
 			tp->snd_cwnd++;
+			if (rtt_fairness)
+				tp->snd_cwnd++;
+		}
 
 		tp->snd_cwnd_cnt = 0;
 	}
