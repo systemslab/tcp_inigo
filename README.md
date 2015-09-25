@@ -22,14 +22,6 @@ RTTs as a signal of congestion. And Inigo can use both.
 The motivation behind the RTT fairness functionality comes from
 the 2nd DCTCP paper listed below.
 
-The motivation behind the stabilize functionality comes from:
-
-Alizadeh, Mohammad, et al.
-"Stability analysis of QCN: the averaging principle."
-Proceedings of the ACM SIGMETRICS joint international conference
-on Measurement and modeling of computer systems. ACM, 2011.
-[PDF](http://sedcl.stanford.edu.oca.ucsc.edu/files/qcn-analysis.pdf)
-
 Authors:
 
      Andrew Shewmaker <agshew@gmail.com>
