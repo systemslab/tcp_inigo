@@ -163,14 +163,15 @@ static u32 inigo_ssthresh(struct sock *sk)
 	const struct inigo *ca = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	u16 alpha = ca->dctcp_alpha;
-	u32 interval = tp->snd_cwnd;
+	u32 nsubwnd = 1;
+	u32 cong_adj;
 
 	if (rtt_fairness) {
+		nsubwnd = tp->snd_cwnd;
+		if (do_div(nsubwnd, rtt_fairness))
+			nsubwnd++;
+
 		alpha = ca->rtt_alpha;
-		if ((tp->snd_cwnd - tp->snd_cwnd_cnt) < rtt_fairness)
-			interval = tp->snd_cwnd % rtt_fairness;
-		else
-			interval = rtt_fairness;
 	} else {
 		/* Only use max alpha when NOT making subwindow adj.
 		 * At least until I get subwindows working with DCTCP.
@@ -178,7 +179,8 @@ static u32 inigo_ssthresh(struct sock *sk)
 		alpha = max(alpha, ca->rtt_alpha);
 	}
 
-	return max(tp->snd_cwnd - ((interval * alpha) >> 11U), 2U);
+	cong_adj = ((tp->snd_cwnd * alpha) >> 11U) / nsubwnd;
+	return max(tp->snd_cwnd - cong_adj, 2U);
 }
 
 /* Minimal DCTP CE state machine:
