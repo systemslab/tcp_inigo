@@ -111,6 +111,11 @@ module_param(rtt_fairness, uint, 0644);
 MODULE_PARM_DESC(rtt_fairness, "if non-zero, react to congestion every x acks during cong avoid,"
 		 " 0 indicates once per window, otherwise 3 < x < 512, defaults to 10");
 
+static unsigned int inigo_force_ecn __read_mostly = 0;
+module_param(inigo_force_ecn, uint, 0644);
+MODULE_PARM_DESC(inigo_force_ecn, "force use of ecn (needed for Mininet testing of fallback)");
+
+static struct tcp_congestion_ops inigo;
 static struct tcp_congestion_ops inigo_rtt;
 
 static void inigo_reset(const struct tcp_sock *tp, struct inigo *ca)
@@ -123,12 +128,23 @@ static void inigo_reset(const struct tcp_sock *tp, struct inigo *ca)
 
 static void inigo_init(struct sock *sk)
 {
-	const struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct inigo *ca = inet_csk_ca(sk);
+	const struct inet_sock *inet = inet_sk(sk);
 
-	if ((tp->ecn_flags & TCP_ECN_OK) ||
+	if (inigo_force_ecn || (tp->ecn_flags & TCP_ECN_OK) ||
 	    (sk->sk_state == TCP_LISTEN ||
 	     sk->sk_state == TCP_CLOSE)) {
+		bool use_ecn = sock_net(sk)->ipv4.sysctl_tcp_ecn == 1 || tcp_ca_needs_ecn(sk);
+		const struct dst_entry *dst = __sk_dst_get(sk);
+		pr_info("inigo: ecn enabled %pI4 force=%u ecn_ok=%u state=%u use_ecn=%u dst_feature=%u\n",
+			&inet->inet_saddr, inigo_force_ecn, tp->ecn_flags & TCP_ECN_OK, sk->sk_state, use_ecn, dst && dst_feature(dst, RTAX_FEATURE_ECN));
+
+		inigo.flags |= TCP_CONG_NEEDS_ECN;
+		//TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_ECE | TCPHDR_CWR;
+		tp->ecn_flags = TCP_ECN_OK;
+		INET_ECN_xmit(sk);
+
 		ca->inigo_alpha = min(inigo_alpha_on_init, DCTCP_MAX_ALPHA);
 
 		ca->prior_snd_una = tp->snd_una;
@@ -144,6 +160,7 @@ static void inigo_init(struct sock *sk)
 	/* No ECN support? Fall back to RTT. Also need to clear
 	 * ECT from sk since it is set during 3WHS for DCTCP.
 	 */
+	pr_info("inigo: ecn disabled %pI4 force=%u ecn_ok=%u state=%u\n", &inet->inet_saddr, inigo_force_ecn, tp->ecn_flags & TCP_ECN_OK, sk->sk_state);
 	inet_csk(sk)->icsk_ca_ops = &inigo_rtt;
 	INET_ECN_dontxmit(sk);
 
