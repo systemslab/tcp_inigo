@@ -132,6 +132,14 @@ static void inigo_init(struct sock *sk)
 	struct inigo *ca = inet_csk_ca(sk);
 	const struct inet_sock *inet = inet_sk(sk);
 
+	if (rtt_fairness != 0)
+		rtt_fairness = clamp(rtt_fairness, INIGO_MIN_FAIRNESS, INIGO_MAX_FAIRNESS);
+
+	ca->inigo_alpha = 0;
+	ca->rtt_min = USEC_PER_SEC;
+	ca->rtts_late = 0;
+	ca->rtts_observed = 0;
+
 	if (inigo_force_ecn || (tp->ecn_flags & TCP_ECN_OK) ||
 	    (sk->sk_state == TCP_LISTEN ||
 	     sk->sk_state == TCP_CLOSE)) {
@@ -163,14 +171,6 @@ static void inigo_init(struct sock *sk)
 	pr_info("inigo: ecn disabled %pI4 force=%u ecn_ok=%u state=%u\n", &inet->inet_saddr, inigo_force_ecn, tp->ecn_flags & TCP_ECN_OK, sk->sk_state);
 	inet_csk(sk)->icsk_ca_ops = &inigo_rtt;
 	INET_ECN_dontxmit(sk);
-
-	if (rtt_fairness != 0)
-		rtt_fairness = clamp(rtt_fairness, INIGO_MIN_FAIRNESS, INIGO_MAX_FAIRNESS);
-
-	ca->inigo_alpha = 0;
-	ca->rtt_min = USEC_PER_SEC;
-	ca->rtts_late = 0;
-	ca->rtts_observed = 0;
 }
 
 static u32 inigo_ssthresh(struct sock *sk)
@@ -262,6 +262,67 @@ static void inigo_ce_state_1_to_0(struct sock *sk)
 	tp->ecn_flags &= ~TCP_ECN_DEMAND_CWR;
 }
 
+static void inigo_update_rtt_alpha(struct inigo *ca)
+{
+	u32 alpha = ca->inigo_alpha;
+	u32 marks = ca->rtts_late;
+	u32 total = ca->rtts_observed;
+
+	/* alpha = (1 - g) * alpha + g * F */
+        alpha -= min_not_zero(alpha, alpha >> inigo_shift_g);
+
+	if (marks) {
+		/* If shift_g == 1, a 32bit value would overflow
+		 * after 8 M.
+		 */
+		marks <<= (10 - inigo_shift_g);
+		do_div(marks, max(1U, total));
+
+		alpha = min(alpha + (u32)marks, DCTCP_MAX_ALPHA);
+        }
+
+	ca->inigo_alpha = alpha;
+}
+
+/* The cwnd reduction in CWR and Recovery use the PRR algorithm
+ * https://datatracker.ietf.org/doc/draft-ietf-tcpm-proportional-rate-reduction/
+ * It computes the number of packets to send (sndcnt) based on packets newly
+ * delivered:
+ *   1) If the packets in flight is larger than ssthresh, PRR spreads the
+ *      cwnd reductions across a full RTT.
+ *   2) If packets in flight is lower than ssthresh (such as due to excess
+ *      losses and/or application stalls), do not perform any further cwnd
+ *      reductions, but instead slow start up to ssthresh.
+ */
+static void inigo_init_cwnd_reduction(struct sock *sk)
+{
+	struct inigo *ca = inet_csk_ca(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tp->high_seq = tp->snd_nxt;
+	tp->tlp_high_seq = 0;
+	// tp->snd_cwnd_cnt = 0; commented out because of rtt-fairness support
+	tp->prior_cwnd = tp->snd_cwnd;
+	tp->prr_delivered = 0;
+	tp->prr_out = 0;
+	tp->snd_ssthresh = inigo_rtt_ssthresh(sk);
+	ca->rtts_late = 0;
+	ca->rtts_observed = 0;
+}
+
+/* Enter CWR state. Disable cwnd undo since congestion is proven with ECN or Delay */
+void inigo_enter_cwr(struct sock *sk)
+{
+	struct tcp_sock *tp = tcp_sk(sk);
+
+	tp->prior_ssthresh = 0;
+	if (inet_csk(sk)->icsk_ca_state < TCP_CA_CWR) {
+		tp->undo_marker = 0;
+		inigo_init_cwnd_reduction(sk);
+		tcp_set_ca_state(sk, TCP_CA_CWR);
+	}
+}
+
 static void inigo_update_alpha(struct sock *sk, u32 flags)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
@@ -304,29 +365,26 @@ static void inigo_update_alpha(struct sock *sk, u32 flags)
 		 */
 		WRITE_ONCE(ca->inigo_alpha, alpha);
 		inigo_reset(tp, ca);
-	}
-}
 
-static void inigo_update_rtt_alpha(struct inigo *ca)
-{
-	u32 alpha = ca->inigo_alpha;
-	u32 marks = ca->rtts_late;
-	u32 total = ca->rtts_observed;
-
-	/* alpha = (1 - g) * alpha + g * F */
-        alpha -= min_not_zero(alpha, alpha >> inigo_shift_g);
-
-	if (marks) {
-		/* If shift_g == 1, a 32bit value would overflow
-		 * after 8 M.
+		/* Fall back to RTT-based congestion control if alpha stays low
+		 * even though RTTs are increasing during the window.
 		 */
-		marks <<= (10 - inigo_shift_g);
-		do_div(marks, max(1U, total));
+		if (ca->acked_bytes_ecn == 0 && ca->rtts_late > 1 && ca->rtts_observed >= slowstart_rtt_observations_needed) {
+			pr_info("inigo: ecn unconfigured, falling back to RTT-based congestion control\n");
+			inet_csk(sk)->icsk_ca_ops = &inigo_rtt;
+			INET_ECN_dontxmit(sk);
 
-		alpha = min(alpha + (u32)marks, DCTCP_MAX_ALPHA);
-        }
+/*
+			inigo_update_rtt_alpha(ca);
 
-	ca->inigo_alpha = alpha;
+			if (ca->inigo_alpha) {
+				inigo_enter_cwr(sk);
+				return;
+			}
+ */
+		}
+		ca->rtts_late = 0;
+	}
 }
 
 static void inigo_state(struct sock *sk, u8 new_state)
@@ -381,45 +439,6 @@ static void inigo_cwnd_event(struct sock *sk, enum tcp_ca_event ev)
 	default:
 		/* Don't care for the rest. */
 		break;
-	}
-}
-
-/* The cwnd reduction in CWR and Recovery use the PRR algorithm
- * https://datatracker.ietf.org/doc/draft-ietf-tcpm-proportional-rate-reduction/
- * It computes the number of packets to send (sndcnt) based on packets newly
- * delivered:
- *   1) If the packets in flight is larger than ssthresh, PRR spreads the
- *      cwnd reductions across a full RTT.
- *   2) If packets in flight is lower than ssthresh (such as due to excess
- *      losses and/or application stalls), do not perform any further cwnd
- *      reductions, but instead slow start up to ssthresh.
- */
-static void inigo_init_cwnd_reduction(struct sock *sk)
-{
-	struct inigo *ca = inet_csk_ca(sk);
-	struct tcp_sock *tp = tcp_sk(sk);
-
-	tp->high_seq = tp->snd_nxt;
-	tp->tlp_high_seq = 0;
-	// tp->snd_cwnd_cnt = 0; commented out because of rtt-fairness support
-	tp->prior_cwnd = tp->snd_cwnd;
-	tp->prr_delivered = 0;
-	tp->prr_out = 0;
-	tp->snd_ssthresh = inigo_rtt_ssthresh(sk);
-	ca->rtts_late = 0;
-	ca->rtts_observed = 0;
-}
-
-/* Enter CWR state. Disable cwnd undo since congestion is proven with ECN or Delay */
-void inigo_enter_cwr(struct sock *sk)
-{
-	struct tcp_sock *tp = tcp_sk(sk);
-
-	tp->prior_ssthresh = 0;
-	if (inet_csk(sk)->icsk_ca_state < TCP_CA_CWR) {
-		tp->undo_marker = 0;
-		inigo_init_cwnd_reduction(sk);
-		tcp_set_ca_state(sk, TCP_CA_CWR);
 	}
 }
 
@@ -522,6 +541,7 @@ static struct tcp_congestion_ops inigo __read_mostly = {
 	.cwnd_event	= inigo_cwnd_event,
 	.ssthresh	= inigo_ssthresh,
 	.cong_avoid	= tcp_reno_cong_avoid,
+	.pkts_acked 	= inigo_pkts_acked,
 	.set_state	= inigo_state,
 	.owner		= THIS_MODULE,
 	.name		= "inigo",
