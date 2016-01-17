@@ -101,10 +101,10 @@ module_param(markthresh, uint, 0644);
 MODULE_PARM_DESC(markthresh, "rtts >  rtt_min + rtt_min * markthresh / 1024"
 		" are considered marks of congestion, defaults to 174 out of 1024");
 
-static unsigned int slowstart_rtt_observations_needed __read_mostly = 10;
+static unsigned int slowstart_rtt_observations_needed __read_mostly = 8;
 module_param(slowstart_rtt_observations_needed, uint, 0644);
 MODULE_PARM_DESC(slowstart_rtt_observations_needed, "minimum number of RTT observations needed"
-		 " to exit slowstart, defaults to 10");
+		 " to exit slowstart, defaults to 8");
 
 static unsigned int rtt_fairness  __read_mostly = 10;
 module_param(rtt_fairness, uint, 0644);
@@ -325,7 +325,7 @@ void inigo_enter_cwr(struct sock *sk)
 
 static void inigo_update_alpha(struct sock *sk, u32 flags)
 {
-	const struct tcp_sock *tp = tcp_sk(sk);
+	struct tcp_sock *tp = tcp_sk(sk);
 	struct inigo *ca = inet_csk_ca(sk);
 	u32 acked_bytes = tp->snd_una - ca->prior_snd_una;
 
@@ -335,11 +335,15 @@ static void inigo_update_alpha(struct sock *sk, u32 flags)
 	if (acked_bytes == 0 && !(flags & CA_ACK_WIN_UPDATE))
 		acked_bytes = inet_csk(sk)->icsk_ack.rcv_mss;
 	if (acked_bytes) {
+		if (flags & CA_ACK_ECE) {
+			if (ca->acked_bytes_ecn == 0 && tcp_in_slow_start(tp)) {
+				tp->snd_ssthresh = tp->snd_cwnd;
+			}
+
+			ca->acked_bytes_ecn += acked_bytes;
+		}
 		ca->acked_bytes_total += acked_bytes;
 		ca->prior_snd_una = tp->snd_una;
-
-		if (flags & CA_ACK_ECE)
-			ca->acked_bytes_ecn += acked_bytes;
 	}
 
 	/* Expired RTT */
